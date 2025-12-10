@@ -1,14 +1,22 @@
-# 🎨 Tapnow Studio (v2.5)
+# 🎨 Tapnow Studio
 
+[![AI-Native](https://img.shields.io/badge/Code-AI_Generated-f9a8d4.svg)](https://deepmind.google/technologies/gemini/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![React](https://img.shields.io/badge/Framework-React_18-61DAFB.svg)](https://reactjs.org/)
 [![Single File](https://img.shields.io/badge/Build-Single__HTML-orange.svg)]()
 
-**一个基于无限画布的节点式 AI 创意工作站。** 无需安装环境，无需 Python 依赖，**下载即用**的单文件 AI 工作流前端。
+> 🤖 **AI-Native Project 声明**
+>
+> 本项目是一个**AI 原生 (AI-Native)** 的实验性开源作品。
+>
+> **绝大部分核心代码、架构设计、UI 布局以及逻辑实现均在 AI (Google Gemini) 的深度辅助下完成。** > 这是一个探索 **"AI 结对编程"** 极限的产物——展示了如何仅通过自然语言交互，在一个**单文件 (Single HTML)** 中构建出包含节点编辑器、多模态 API 调用、视频分析算法等复杂功能的现代化应用。
+>
 
 ---
 
+
 ## 📖 简介 (Introduction)
+
+
 
 **Tapnow Studio** 是一个运行在浏览器中的可视化 AI 工作流工具。它采用“节点编辑”的交互方式（类似 ComfyUI），将当前最强大的 AI 模型能力聚合在一个无限缩放的画布上。
 
