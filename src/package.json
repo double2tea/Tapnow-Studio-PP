@@ -1,7 +1,7 @@
 {
   "name": "tapnow-studio",
   "private": true,
-  "version": "3.7.33fp",
+  "version": "3.7.34",
   "type": "module",
   "scripts": {
     "dev": "vite",
