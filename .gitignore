@@ -5,5 +5,3 @@ dist/
 *.exe
 .DS_Store
 thumbs.db
-Tapnow Studio-V*.html
-!Tapnow Studio-V3.7.34.html
