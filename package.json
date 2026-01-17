@@ -1,7 +1,7 @@
 {
   "name": "tapnow-studio",
   "private": true,
-  "version": "3.8.0-rc.3",
+  "version": "3.8.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -14,7 +14,6 @@
     "jszip": "^3.10.1",
     "lucide-react": "^0.344.0",
     "marked": "^12.0.0",
-    "openai": "^6.16.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },
