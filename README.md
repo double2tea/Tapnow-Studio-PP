@@ -1,4 +1,4 @@
-﻿# Tapnow-Studio-PP
+# Tapnow-Studio-PP
 
 自原作者 [@zhengxinlan1995-code](https://github.com/zhengxinlan1995-code) 的 2.6.1 版本以来到 3.8.0 版本（截至 2026-01-17）共经历 至少 135 次 快速迭代与修复（含 81 个公开版本号及 54+ 次内部逻辑微测），包含 6 个 里程碑版本与 3 次 重构。目前已进化为功能较为完善的工作流设计生产平台。
 
@@ -52,7 +52,7 @@
 
 ---
 
-# 🎨 Tapnow Studio (Original Project)
+# 🎨 麻衣画布  (Original Project)
 
 <br>
 
