@@ -1364,6 +1364,25 @@ const styles = `
         .theme-light .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #cbd5e1; }
         .theme-solarized .custom-scrollbar::-webkit-scrollbar-thumb { background: #c9c2a8; border-radius: 2px; }
         .theme-solarized .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #b9b091; }
+        .theme-solarized button[class*="bg-blue-"],
+        .theme-solarized button[class*="bg-green-"],
+        .theme-solarized button[class*="from-blue-"],
+        .theme-solarized button[class*="from-green-"],
+        .theme-solarized button[class*="to-emerald-"],
+        .theme-solarized button[class*="to-indigo-"] {
+            background-image: none !important;
+            background-color: #616161 !important;
+            border-color: #525252 !important;
+            color: #fdf6e3 !important;
+        }
+        .theme-solarized button[class*="bg-blue-"]:hover,
+        .theme-solarized button[class*="bg-green-"]:hover,
+        .theme-solarized button[class*="from-blue-"]:hover,
+        .theme-solarized button[class*="from-green-"]:hover,
+        .theme-solarized button[class*="to-emerald-"]:hover,
+        .theme-solarized button[class*="to-indigo-"]:hover {
+            background-color: #555555 !important;
+        }
         .resize-handle { cursor: nwse-resize; opacity: 0; transition: opacity 0.2s; }
         .node-wrapper:hover .resize-handle { opacity: 1; }
         
@@ -1624,7 +1643,8 @@ const DEFAULT_MODEL_LIBRARY = [
                 videoResolutions: isVideo ? [...VIDEO_RES_OPTIONS] : null,
                 supportsFirstLastFrame,
                 supportsHD,
-                apiType: DEFAULT_PROVIDERS[config.provider]?.apiType || 'openai'
+                apiType: DEFAULT_PROVIDERS[config.provider]?.apiType || 'openai',
+                customParams: []
             });
         }),
     {
@@ -1638,7 +1658,8 @@ const DEFAULT_MODEL_LIBRARY = [
         videoResolutions: null,
         supportsFirstLastFrame: false,
         supportsHD: false,
-        apiType: 'modelscope'
+        apiType: 'modelscope',
+        customParams: []
     },
     {
         id: 'gemini-3-pro-image-preview',
@@ -1651,7 +1672,8 @@ const DEFAULT_MODEL_LIBRARY = [
         videoResolutions: null,
         supportsFirstLastFrame: false,
         supportsHD: false,
-        apiType: 'gemini'
+        apiType: 'gemini',
+        customParams: []
     }
 ];
 
@@ -1695,6 +1717,68 @@ const normalizeVideoResolutionLower = (value) => {
     const normalized = normalizeVideoResolution(value);
     if (!normalized || normalized === 'Auto') return '';
     return normalized.toLowerCase();
+};
+const isImageModelType = (type) => type === 'Image' || type === 'ChatImage';
+const normalizeCustomParams = (params) => {
+    if (!Array.isArray(params)) return [];
+    return params.map((param, index) => {
+        if (!param) return null;
+        const id = String(param.id || '').trim()
+            || `param-${Date.now()}-${Math.random().toString(36).slice(2, 6)}-${index}`;
+        const name = typeof param.name === 'string' ? param.name : '';
+        const values = Array.isArray(param.values)
+            ? param.values.map(value => String(value).trim()).filter(Boolean)
+            : [];
+        return {
+            id,
+            name,
+            values,
+            override: !!param.override
+        };
+    }).filter(Boolean);
+};
+const getCustomParamSelection = (param, selections) => {
+    if (!param || !selections) return '';
+    const byId = param.id && selections[param.id];
+    if (byId !== undefined && byId !== null && byId !== '') return byId;
+    const byName = param.name && selections[param.name];
+    if (byName !== undefined && byName !== null && byName !== '') return byName;
+    return '';
+};
+const applyCustomParamsToPayload = (payload, customParams, selections) => {
+    if (!payload || !Array.isArray(customParams) || customParams.length === 0) return payload;
+    const isFormData = typeof FormData !== 'undefined' && payload instanceof FormData;
+    customParams.forEach((param) => {
+        const name = String(param?.name || '').trim();
+        if (!name) return;
+        const value = getCustomParamSelection(param, selections);
+        if (value === '' || value === undefined || value === null) return;
+        if (isFormData) {
+            if (param.override || !payload.has(name)) {
+                payload.set(name, value);
+            }
+            return;
+        }
+        if (param.override || payload[name] === undefined) {
+            payload[name] = value;
+        }
+    });
+    return payload;
+};
+const buildCustomParamPreviewPayload = (basePayload, customParams) => {
+    if (!basePayload) return basePayload;
+    if (!Array.isArray(customParams) || customParams.length === 0) return basePayload;
+    const preview = { ...basePayload };
+    customParams.forEach((param) => {
+        const name = String(param?.name || '').trim();
+        if (!name) return;
+        const value = Array.isArray(param.values) && param.values.length > 0 ? param.values[0] : '';
+        if (value === '') return;
+        if (param.override || preview[name] === undefined) {
+            preview[name] = value;
+        }
+    });
+    return preview;
 };
 // 根据模型返回不同的分辨率选项
 const getDefaultResolutionsForModel = (modelId) => {
@@ -1942,11 +2026,13 @@ const extractKeyFrames = (src, { fps = 2 } = {}) => {
 };
 
 // --- Component: ImageCompareView (Beautified & Optimized) ---
-const ImageCompareView = React.memo(({ img1, img2 }) => {
+const ImageCompareView = React.memo(({ img1, img2, theme = 'dark' }) => {
     const [pos, setPos] = useState(50);
     const containerRef = useRef(null);
     const [isHovering, setIsHovering] = useState(false);
     const requestRef = useRef();
+    const isSolarized = theme === 'solarized';
+    const isDark = theme === 'dark';
 
     const handleMove = useCallback((e) => {
         if (!containerRef.current) return;
@@ -1976,7 +2062,12 @@ const ImageCompareView = React.memo(({ img1, img2 }) => {
     const displayImg2 = img2 || img1;
 
     if (!displayImg1) return (
-        <div className="w-full h-full flex flex-col items-center justify-center text-zinc-500 bg-zinc-900/50 rounded-lg border border-zinc-800 border-dashed pointer-events-none">
+        <div className={`w-full h-full flex flex-col items-center justify-center rounded-lg border border-dashed pointer-events-none ${isDark
+            ? 'text-zinc-500 bg-zinc-900/50 border-zinc-800'
+            : isSolarized
+                ? 'text-zinc-600 bg-[#eee8d5] border-[#d7cfb2]'
+                : 'text-zinc-500 bg-zinc-100 border-zinc-200'
+            }`}>
             <Split size={24} className="mb-2 opacity-50" />
             <span className="text-xs font-medium">连接图片以对比</span>
         </div>
@@ -1985,7 +2076,12 @@ const ImageCompareView = React.memo(({ img1, img2 }) => {
     return (
         <div
             ref={containerRef}
-            className="relative w-full h-full cursor-col-resize overflow-hidden group rounded-lg select-none shadow-2xl border border-zinc-800 bg-[#09090b]"
+            className={`relative w-full h-full cursor-col-resize overflow-hidden group rounded-lg select-none shadow-2xl border ${isDark
+                ? 'border-zinc-800 bg-[#09090b]'
+                : isSolarized
+                    ? 'border-[#eee8d5] bg-[#eee8d5]'
+                    : 'border-zinc-200 bg-zinc-100'
+                }`}
             onMouseMove={handleMove}
             onTouchMove={handleMove}
             onMouseEnter={() => setIsHovering(true)}
@@ -1994,7 +2090,7 @@ const ImageCompareView = React.memo(({ img1, img2 }) => {
             {/* Checkered Background */}
             <div className="absolute inset-0 opacity-20 pointer-events-none"
                 style={{
-                    backgroundImage: 'conic-gradient(#333 90deg, transparent 90deg), conic-gradient(transparent 90deg, #333 90deg)',
+                    backgroundImage: `conic-gradient(${isDark ? '#333' : isSolarized ? '#c9c2a8' : '#bbb'} 90deg, transparent 90deg), conic-gradient(transparent 90deg, ${isDark ? '#333' : isSolarized ? '#c9c2a8' : '#bbb'} 90deg)`,
                     backgroundSize: '20px 20px',
                     backgroundPosition: '0 0, 10px 10px'
                 }}
@@ -2843,7 +2939,8 @@ function TapnowApp() {
                         durations: Array.isArray(entry.durations) ? entry.durations : null,
                         videoResolutions: Array.isArray(entry.videoResolutions) ? entry.videoResolutions : null,
                         supportsFirstLastFrame: !!entry.supportsFirstLastFrame,
-                        supportsHD: !!entry.supportsHD
+                        supportsHD: !!entry.supportsHD,
+                        customParams: normalizeCustomParams(entry.customParams)
                     })).filter((entry) => entry.id);
                 }
             } catch (e) {
@@ -2852,6 +2949,7 @@ function TapnowApp() {
         }
         return DEFAULT_MODEL_LIBRARY.map((entry) => ({ ...entry }));
     });
+    const initialLibraryCollapseRef = useRef(false);
 
     useEffect(() => {
         try {
@@ -2859,6 +2957,12 @@ function TapnowApp() {
         } catch (e) {
             console.error('保存 modelLibrary 配置失败:', e);
         }
+    }, [modelLibrary]);
+    useEffect(() => {
+        if (initialLibraryCollapseRef.current) return;
+        if (!modelLibrary.length) return;
+        setCollapsedLibraryModels(new Set(modelLibrary.map(entry => entry.id)));
+        initialLibraryCollapseRef.current = true;
     }, [modelLibrary]);
 
     const [apiConfigs, setApiConfigs] = useState(() => {
@@ -3363,6 +3467,7 @@ function TapnowApp() {
     const [editingApiModels, setEditingApiModels] = useState(() => new Set());
     const [editingLibraryModels, setEditingLibraryModels] = useState(() => new Set());
     const [collapsedLibraryModels, setCollapsedLibraryModels] = useState(() => new Set());
+    const [libraryPreviewModels, setLibraryPreviewModels] = useState(() => new Set());
     const [historyOpen, setHistoryOpen] = useState(false);
     const [historyCachePanelOpen, setHistoryCachePanelOpen] = useState(false);
     const [historyQueuePanelOpen, setHistoryQueuePanelOpen] = useState(false);
@@ -4489,7 +4594,8 @@ function TapnowApp() {
                 durations: Array.isArray(entry.durations) ? entry.durations : null,
                 videoResolutions: Array.isArray(entry.videoResolutions) ? entry.videoResolutions : null,
                 supportsFirstLastFrame: !!entry.supportsFirstLastFrame,
-                supportsHD: !!entry.supportsHD
+                supportsHD: !!entry.supportsHD,
+                customParams: normalizeCustomParams(entry.customParams)
             });
         });
         return map;
@@ -4499,7 +4605,7 @@ function TapnowApp() {
 
     const resolveApiConfig = useCallback((config) => {
         if (!config) return null;
-        const libraryEntry = config.libraryId ? modelLibraryMap.get(config.libraryId) : modelLibraryMap.get(config.id);
+        const libraryEntry = config.libraryId ? modelLibraryMap.get(config.libraryId) : null;
         const resolvedLibrary = libraryEntry || null;
         return {
             ...config,
@@ -4512,7 +4618,8 @@ function TapnowApp() {
             durations: resolvedLibrary ? resolvedLibrary.durations : (config.durations || null),
             videoResolutions: resolvedLibrary ? resolvedLibrary.videoResolutions : (config.videoResolutions || null),
             supportsFirstLastFrame: resolvedLibrary ? !!resolvedLibrary.supportsFirstLastFrame : !!config.supportsFirstLastFrame,
-            supportsHD: resolvedLibrary ? !!resolvedLibrary.supportsHD : !!config.supportsHD
+            supportsHD: resolvedLibrary ? !!resolvedLibrary.supportsHD : !!config.supportsHD,
+            customParams: resolvedLibrary ? normalizeCustomParams(resolvedLibrary.customParams) : normalizeCustomParams(config.customParams)
         };
     }, [modelLibraryMap]);
 
@@ -4576,6 +4683,81 @@ function TapnowApp() {
         const config = apiConfigsMap.get(modelId);
         return config?.displayName || config?.modelName || config?.id || modelId;
     }, [apiConfigsMap]);
+
+    const renderCustomParamInputs = useCallback((modelId, currentValues, onChange) => {
+        const config = apiConfigsMap.get(modelId);
+        const customParams = Array.isArray(config?.customParams) ? config.customParams : [];
+        if (!customParams.length) return null;
+        const values = currentValues || {};
+        return (
+            <div className="flex flex-col gap-2">
+                <div className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>自定义参数</div>
+                {customParams.map((param) => {
+                    const paramId = param.id || param.name;
+                    const selectedValue = getCustomParamSelection(param, values);
+                    const options = Array.isArray(param.values) ? param.values : [];
+                    return (
+                        <div key={paramId} className="flex items-center gap-2">
+                            <span className={`text-[10px] w-16 truncate ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>
+                                {param.name || '参数'}
+                            </span>
+                            {options.length > 0 ? (
+                                <select
+                                    value={selectedValue || ''}
+                                    onChange={(e) => {
+                                        const nextValue = e.target.value;
+                                        const next = { ...values };
+                                        if (nextValue) {
+                                            next[paramId] = nextValue;
+                                        } else {
+                                            delete next[paramId];
+                                        }
+                                        onChange(next);
+                                    }}
+                                    className={`flex-1 px-2 py-1 rounded text-xs border ${theme === 'dark'
+                                        ? 'bg-zinc-800 border-zinc-700 text-zinc-200'
+                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
+                                        }`}
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                >
+                                    <option value="">不设置</option>
+                                    {options.map(option => (
+                                        <option key={option} value={option}>{option}</option>
+                                    ))}
+                                </select>
+                            ) : (
+                                <input
+                                    type="text"
+                                    value={selectedValue || ''}
+                                    onChange={(e) => {
+                                        const nextValue = e.target.value;
+                                        const next = { ...values };
+                                        if (nextValue) {
+                                            next[paramId] = nextValue;
+                                        } else {
+                                            delete next[paramId];
+                                        }
+                                        onChange(next);
+                                    }}
+                                    placeholder="例如: size/quality"
+                                    className={`flex-1 px-2 py-1 rounded text-xs border ${theme === 'dark'
+                                        ? 'bg-zinc-800 border-zinc-700 text-zinc-200 placeholder-zinc-500'
+                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
+                                        }`}
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                />
+                            )}
+                            {param.override && (
+                                <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-600 border border-emerald-500/30">
+                                    覆盖
+                                </span>
+                            )}
+                        </div>
+                    );
+                })}
+            </div>
+        );
+    }, [apiConfigsMap, theme]);
 
     // V3.4.7: 按 Provider 分组的 API 配置（用于两级菜单）
     const groupedApiConfigs = useMemo(() => {
@@ -6312,7 +6494,8 @@ function TapnowApp() {
             videoResolutions: null,
             supportsFirstLastFrame: false,
             supportsHD: false,
-            apiType: 'openai'
+            apiType: 'openai',
+            customParams: []
         };
         setModelLibrary(prev => [...prev, newEntry]);
         setEditingLibraryModels(prev => {
@@ -6322,9 +6505,46 @@ function TapnowApp() {
         });
         setCollapsedLibraryModels(prev => {
             const next = new Set(prev);
-            next.delete(newId);
+            next.add(newId);
             return next;
         });
+    };
+
+    const addModelLibraryCustomParam = (entryId) => {
+        if (!entryId) return;
+        setModelLibrary(prev => prev.map((entry) => {
+            if (entry.id !== entryId) return entry;
+            const nextParams = Array.isArray(entry.customParams) ? [...entry.customParams] : [];
+            nextParams.push({
+                id: `param-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                name: '',
+                values: [],
+                override: false
+            });
+            return { ...entry, customParams: nextParams };
+        }));
+    };
+
+    const updateModelLibraryCustomParam = (entryId, paramId, updates) => {
+        if (!entryId || !paramId) return;
+        setModelLibrary(prev => prev.map((entry) => {
+            if (entry.id !== entryId) return entry;
+            const nextParams = Array.isArray(entry.customParams) ? entry.customParams.map((param) => (
+                param.id === paramId ? { ...param, ...updates } : param
+            )) : [];
+            return { ...entry, customParams: nextParams };
+        }));
+    };
+
+    const deleteModelLibraryCustomParam = (entryId, paramId) => {
+        if (!entryId || !paramId) return;
+        setModelLibrary(prev => prev.map((entry) => {
+            if (entry.id !== entryId) return entry;
+            const nextParams = Array.isArray(entry.customParams)
+                ? entry.customParams.filter((param) => param.id !== paramId)
+                : [];
+            return { ...entry, customParams: nextParams };
+        }));
     };
 
     const updateModelLibraryEntry = (id, updates) => {
@@ -6342,6 +6562,11 @@ function TapnowApp() {
             return next;
         });
         setCollapsedLibraryModels(prev => {
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+        });
+        setLibraryPreviewModels(prev => {
             const next = new Set(prev);
             next.delete(id);
             return next;
@@ -6378,6 +6603,16 @@ function TapnowApp() {
     const toggleLibraryModelCollapse = useCallback((id) => {
         if (!id) return;
         setCollapsedLibraryModels(prev => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+    }, []);
+
+    const toggleLibraryPreview = useCallback((id) => {
+        if (!id) return;
+        setLibraryPreviewModels(prev => {
             const next = new Set(prev);
             if (next.has(id)) next.delete(id);
             else next.add(id);
@@ -9510,6 +9745,7 @@ function TapnowApp() {
         };
         // 优先使用 options 中的 model，其次使用节点设置，最后使用默认值
         const modelId = options.model || node?.settings?.model || (type === 'image' ? 'nano-banana' : 'sora-2');
+        const customParamSelections = options.customParams || node?.settings?.customParams || null;
         // V3.4.19: 使用统一的 getApiCredentials 获取凭据（只从Provider获取）
         const credentials = getApiCredentials(modelId);
         let apiKeyRaw = credentials.key;
@@ -9711,12 +9947,14 @@ function TapnowApp() {
                 let useMultipart = false;
                 // V3.4.20: 获取模型配置用于后续判断
                 const config = apiConfigsMap.get(modelId);
+                const customParams = Array.isArray(config?.customParams) ? config.customParams : [];
                 const providerKey = config?.provider;
                 const apiType = credentials.apiType || providers[providerKey]?.apiType || 'openai';
                 const useProxy = !!credentials.useProxy;
                 const forceAsync = !!credentials.forceAsync;
                 const isModelScope = apiType === 'modelscope';
                 const isGeminiNative = apiType === 'gemini';
+                const isChatImage = config?.type === 'ChatImage';
                 const useAsync = isModelScope ? forceAsync : false;
 
                 // --- 模型特征定义 (融合 V2.5-3 和 V2.5-4) ---
@@ -9754,8 +9992,29 @@ function TapnowApp() {
 
                 // --- 核心逻辑分支 ---
 
+                // 0. Chat Image (使用 Chat 格式返回图片)
+                if (isChatImage) {
+                    endpoint = '/v1/chat/completions';
+                    const contentParts = [];
+                    if (prompt) contentParts.push({ type: 'text', text: prompt });
+                    const inputImages = connectedImages.length > 0
+                        ? connectedImages
+                        : (sourceImage ? [sourceImage] : []);
+                    inputImages.forEach((img) => {
+                        if (!img) return;
+                        contentParts.push({ type: 'image_url', image_url: { url: img } });
+                    });
+                    if (contentParts.length === 0) {
+                        contentParts.push({ type: 'text', text: '生成图片' });
+                    }
+                    payload = {
+                        model: config?.modelName || modelId,
+                        messages: [{ role: 'user', content: contentParts }],
+                        stream: false
+                    };
+                }
                 // 0. ModelScope Z-Image (异步任务)
-                if (isModelScope) {
+                else if (isModelScope) {
                     const modelName = config?.modelName || 'Tongyi-MAI/Z-Image-Turbo';
                     endpoint = `${baseUrl}/v1/images/generations`;
                     payload = {
@@ -10119,6 +10378,8 @@ function TapnowApp() {
                     };
                 }
 
+                payload = applyCustomParamsToPayload(payload, customParams, customParamSelections);
+
                 // --- 发送请求逻辑 (通用) (Supports Failover) ---
                 // --- 发送请求逻辑 (通用) (Supports Failover) ---
 
@@ -10331,7 +10592,40 @@ function TapnowApp() {
                 }
 
                 let imageUrls = [];
-                if (isModelScope) {
+                if (isChatImage) {
+                    let chatContent = null;
+                    const primaryMessage = data?.choices?.[0]?.message || data?.data?.choices?.[0]?.message;
+                    if (primaryMessage?.content !== undefined) {
+                        if (Array.isArray(primaryMessage.content)) {
+                            chatContent = primaryMessage.content
+                                .map(part => (typeof part?.text === 'string' ? part.text : ''))
+                                .filter(Boolean)
+                                .join('\n');
+                        } else {
+                            chatContent = primaryMessage.content;
+                        }
+                    } else if (data?.content) {
+                        chatContent = data.content;
+                    } else if (data?.text) {
+                        chatContent = data.text;
+                    } else if (data?.message) {
+                        chatContent = typeof data.message === 'string' ? data.message : data.message.content;
+                    } else if (data?.result) {
+                        chatContent = typeof data.result === 'string' ? data.result : data.result.content;
+                    } else if (data?.data?.content) {
+                        chatContent = data.data.content;
+                    } else if (data?.data?.text) {
+                        chatContent = data.data.text;
+                    } else if (data?.data?.message) {
+                        chatContent = typeof data.data.message === 'string' ? data.data.message : data.data.message.content;
+                    } else if (data?.data?.result) {
+                        chatContent = typeof data.data.result === 'string' ? data.data.result : data.data.result.content;
+                    }
+                    if (chatContent && typeof chatContent !== 'string') {
+                        chatContent = JSON.stringify(chatContent);
+                    }
+                    imageUrls = extractChatImageUrls(data, chatContent || '');
+                } else if (isModelScope) {
                     const taskIdForPoll = data?.task_id || data?.taskId || data?.data?.task_id || data?.output?.task_id || data?.output?.taskId;
                     const rawImages = data?.output_images || data?.output?.output_images || data?.data?.output_images || data?.output?.images || data?.data?.output?.output_images || [];
                     imageUrls = Array.isArray(rawImages)
@@ -10542,6 +10836,8 @@ function TapnowApp() {
             if (type === 'video') {
                 // V3.4.20: Explicitly define config for video generation block
                 const config = apiConfigsMap.get(modelId);
+                const customParams = Array.isArray(config?.customParams) ? config.customParams : [];
+                const applyVideoCustomParams = (payload) => applyCustomParamsToPayload(payload, customParams, customParamSelections);
                 // Veo 3.x 图生视频：按 /v2/videos/generations 规范发送 JSON，使用 images 数组而不是 input_image
                 if (modelId.includes('veo')) {
                     const endpoint = `${baseUrl} /v2/videos / generations`;
@@ -10694,6 +10990,7 @@ function TapnowApp() {
                         // 按接口说明：不传 aspect_ratio 时自动根据参考图匹配；只有非 Auto 时才显式传
                         ...(aspectRatio ? { aspect_ratio: aspectRatio } : {})
                     };
+                    applyVideoCustomParams(veoPayload);
 
                     // 详细调试日志
                     console.log('Veo: 准备发送请求', {
@@ -10807,6 +11104,7 @@ function TapnowApp() {
                     }
 
                     // 4. 发送纯 JSON 请求
+                    applyVideoCustomParams(payload);
                     const resp = await fetch(endpoint, {
                         method: 'POST',
                         headers: {
@@ -10896,6 +11194,7 @@ function TapnowApp() {
                         formData.append('image', blob, 'input.png');
                         formData.append('size', sizeStr); // Ensure size is passed for generic
                     }
+                    applyVideoCustomParams(formData);
                     body = formData;
                 } else {
                     headers['Content-Type'] = 'application/json';
@@ -10915,6 +11214,7 @@ function TapnowApp() {
                         if (modelId.includes('sora') && config?.supportsHD && (options.isHD || node?.settings?.isHD)) {
                             formData.append('quality', 'hd');
                         }
+                        applyVideoCustomParams(formData);
                         body = formData;
                     } else if (modelId.includes('jimeng')) {
                         endpoint = `${baseUrl}/v1/videos/generations`;
@@ -10928,18 +11228,23 @@ function TapnowApp() {
                             ratio: jimengRatio
                         };
                         if (jimengResolution) payload.resolution = jimengResolution;
+                        applyVideoCustomParams(payload);
                         body = JSON.stringify(payload);
                     } else if (modelId.includes('grok')) {
                         endpoint = `${baseUrl} /v1/videos`;
-                        body = JSON.stringify({
+                        const payload = {
                             model: config?.modelName || 'grok-video-3',
                             prompt,
                             aspect_ratio: ratio,
                             duration: durationValueNum
-                        });
+                        };
+                        applyVideoCustomParams(payload);
+                        body = JSON.stringify(payload);
                     } else {
                         endpoint = `${baseUrl} /minimax/v1 / video_generation`;
-                        body = JSON.stringify({ model: config?.modelName, prompt, resolution: sizeStr });
+                        const payload = { model: config?.modelName, prompt, resolution: sizeStr };
+                        applyVideoCustomParams(payload);
+                        body = JSON.stringify(payload);
                     }
                 }
 
@@ -12046,7 +12351,25 @@ function TapnowApp() {
                     if (tempState.connections.length > 0) setConnections(tempState.connections);
                     if (tempState.chatSessions.length > 0) setChatSessions(tempState.chatSessions);
                     if (tempState.characterLibrary.length > 0) setCharacterLibrary(tempState.characterLibrary);
-                    if (tempState.modelLibraryLoaded) setModelLibrary(tempState.modelLibrary);
+                    if (tempState.modelLibraryLoaded) {
+                        const normalizedLibrary = tempState.modelLibrary
+                            .map((entry) => ({
+                                id: entry.id,
+                                displayName: entry.displayName || entry.id,
+                                modelName: entry.modelName || entry.id,
+                                type: entry.type || 'Chat',
+                                apiType: entry.apiType || 'openai',
+                                ratioLimits: Array.isArray(entry.ratioLimits) ? entry.ratioLimits : null,
+                                resolutionLimits: Array.isArray(entry.resolutionLimits) ? entry.resolutionLimits : null,
+                                durations: Array.isArray(entry.durations) ? entry.durations : null,
+                                videoResolutions: Array.isArray(entry.videoResolutions) ? entry.videoResolutions : null,
+                                supportsFirstLastFrame: !!entry.supportsFirstLastFrame,
+                                supportsHD: !!entry.supportsHD,
+                                customParams: normalizeCustomParams(entry.customParams)
+                            }))
+                            .filter((entry) => entry.id);
+                        setModelLibrary(normalizedLibrary);
+                    }
                     if (['dark', 'light', 'solarized'].includes(tempState.theme)) {
                         setTheme(tempState.theme);
                     }
@@ -12391,7 +12714,7 @@ function TapnowApp() {
             || apiConfigs.find(c => c.type === 'Video' && (c.id === 'sora-2' || c.id === 'sora-2-pro'))?.id
             || apiConfigs.find(c => c.type === 'Video')?.id
             || '';
-        const defaultImageModel = lastUsedImageModel || apiConfigs.find(c => c.type === 'Image')?.id || '';
+        const defaultImageModel = lastUsedImageModel || apiConfigs.find(c => isImageModelType(c.type))?.id || '';
         const defaultChatModel = lastUsedExtractModel || apiConfigs.find(c => c.type === 'Chat')?.id || '';
         const defaultRatio = lastUsedRatio || '16:9';
         const defaultVideoResolution = lastUsedVideoResolution || '720p';
@@ -12583,7 +12906,7 @@ function TapnowApp() {
         const created = addNode(targetType, worldX, worldY, descNodeId);
         if (!created?.id) return;
 
-        const defaultImageModel = descNode.settings?.imageModel || lastUsedImageModel || apiConfigs.find(c => c.type === 'Image')?.id || '';
+        const defaultImageModel = descNode.settings?.imageModel || lastUsedImageModel || apiConfigs.find(c => isImageModelType(c.type))?.id || '';
         const defaultRatio = descNode.settings?.imageRatio || lastUsedRatio || '16:9';
         const defaultResolution = descNode.settings?.imageResolution || lastUsedImageResolution || '2K';
         const defaultChatModel = descNode.settings?.chatModel || lastUsedExtractModel || '';
@@ -12712,7 +13035,7 @@ function TapnowApp() {
 
         if (mode === 'image') {
             // 图片模式: 使用图片模型
-            defaultModel = localStorage.getItem('tapnow_last_image_model') || apiConfigs.find(c => c.type === 'Image')?.id || '';
+            defaultModel = localStorage.getItem('tapnow_last_image_model') || apiConfigs.find(c => isImageModelType(c.type))?.id || '';
             defaultRatio = '1:1';  // 图片默认1:1
             defaultDuration = undefined;  // 图片没有秒数
         } else {
@@ -13180,7 +13503,8 @@ function TapnowApp() {
             ratio: shot.ratio || '16:9',
             duration: normalizedDuration,
             resolution: normalizeVideoResolutionLower(shot.resolution || '720p'),
-            isHD: !!shot.isHD
+            isHD: !!shot.isHD,
+            customParams: shot.customParams || null
         };
 
 
@@ -13220,10 +13544,10 @@ function TapnowApp() {
         }
 
         // 2. 获取选中的图片模型
-        const selectedModel = shot.model || localStorage.getItem('tapnow_last_image_model') || (apiConfigs.find(c => c.type === 'Image')?.id || '');
+        const selectedModel = shot.model || localStorage.getItem('tapnow_last_image_model') || (apiConfigs.find(c => isImageModelType(c.type))?.id || '');
         const modelConfig = apiConfigsMap.get(selectedModel);
 
-        if (!modelConfig || modelConfig.type !== 'Image') {
+        if (!modelConfig || !isImageModelType(modelConfig.type)) {
             alert('请先选择一个图片模型');
             return;
         }
@@ -13254,7 +13578,8 @@ function TapnowApp() {
         const overrideOptions = {
             model: selectedModel,
             ratio: shot.ratio || '1:1',
-            resolution: normalizeImageResolution(shot.resolution || '2K')
+            resolution: normalizeImageResolution(shot.resolution || '2K'),
+            customParams: shot.customParams || null
         };
 
 
@@ -16757,7 +17082,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                         : theme === 'dark'
                             ? 'border border-zinc-800'
                             : theme === 'solarized'
-                                ? 'border border-[#eee8d5]'
+                                ? 'border border-[#ddd6c1]'
                                 : 'border border-zinc-200'
                         } ${theme === 'dark' ? 'bg-[#18181b]' : theme === 'solarized' ? 'bg-[#fdf6e3]' : 'bg-white'}`}
                     style={{
@@ -16767,7 +17092,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                         height: node.height,
                         cursor: (dragNodeId === node.id || (dragNodeId && selectedNodeIds.has(node.id))) ? 'grabbing' : 'default',
                         zIndex: isDragging ? 50 : 10, // 拖动时提升 z-index，避免被其他节点遮挡
-                        border: `1px solid ${theme === 'dark' ? '#3f3f46' : theme === 'solarized' ? '#eee8d5' : '#e4e4e7'}`,
+                        border: `1px solid ${theme === 'dark' ? '#3f3f46' : theme === 'solarized' ? '#ddd6c1' : '#e4e4e7'}`,
                         background: theme === 'dark' ? '#18181b' : theme === 'solarized' ? '#fdf6e3' : '#fff',
                         boxShadow: 'none',
                         borderRadius: '0',
@@ -17018,7 +17343,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                         : theme === 'dark'
                             ? 'border border-zinc-800 shadow-black/40'
                             : theme === 'solarized'
-                                ? 'border border-[#eee8d5] shadow-black/10'
+                                ? 'border border-[#ddd6c1] shadow-black/10'
                                 : 'border border-zinc-200 shadow-black/10'
                     } ${isHoverTarget && ((connectingSource && connectingSource !== node.id) || (connectingTarget && connectingTarget !== node.id)) ? 'ring-2 ring-green-500/50' : ''} ${theme === 'dark' ? 'bg-[#18181b]' : theme === 'solarized' ? 'bg-[#fdf6e3]' : 'bg-white'
                     }`}
@@ -17225,7 +17550,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     }}
                                     placeholder="输入小说内容（最多10,000字）..."
                                     maxLength={10000}
-                                    className={`w-full flex-1 resize-none outline-none text-sm p-2 rounded border ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-200 placeholder-zinc-500' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
+                                    className={`w-full flex-1 resize-none outline-none text-sm p-2 rounded border ${theme === 'dark'
+                                        ? 'bg-zinc-800 border-zinc-700 text-zinc-200 placeholder-zinc-500'
+                                        : theme === 'solarized'
+                                            ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400'
+                                            : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
+                                        }`}
                                     onMouseDown={(e) => e.stopPropagation()}
                                 />
                                 <div className="text-right text-[10px] text-zinc-500 shrink-0">
@@ -17264,7 +17594,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 onClick={(e) => { e.stopPropagation(); setActiveDropdown(activeDropdown?.nodeId === node.id && activeDropdown.type === 'extract-model' ? null : { nodeId: node.id, type: 'extract-model' }); }}
                                                 className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-xs border transition-colors ${theme === 'dark'
                                                     ? 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:border-zinc-600'
-                                                    : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
+                                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 hover:border-[#d7cfb2]' : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
                                                     }`}
                                                 onMouseDown={(e) => e.stopPropagation()}
                                             >
@@ -17536,7 +17866,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     placeholder="输入角色/场景描述提示词..."
                                                     className={`w-full h-28 resize-none outline-none text-sm p-2 rounded border ${theme === 'dark'
                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200 placeholder-zinc-500'
-                                                        : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
+                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
                                                         }`}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                 />
@@ -17549,7 +17879,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         onClick={(e) => { e.stopPropagation(); setActiveDropdown(activeDropdown?.nodeId === node.id && activeDropdown.type === 'desc-model' ? null : { nodeId: node.id, type: 'desc-model' }); }}
                                                         className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-xs border transition-colors ${theme === 'dark'
                                                             ? 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:border-zinc-600'
-                                                            : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
+                                                            : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 hover:border-[#d7cfb2]' : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
                                                             }`}
                                                         onMouseDown={(e) => e.stopPropagation()}
                                                     >
@@ -17629,7 +17959,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     }}
                                                     className={`w-full text-xs border rounded px-2 py-1.5 outline-none focus:border-blue-500 ${theme === 'dark'
                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-300'
-                                                        : 'bg-white border-zinc-300 text-zinc-800'
+                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                         }`}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                 >
@@ -17785,7 +18115,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         onClick={(e) => { e.stopPropagation(); setActiveDropdown(activeDropdown?.nodeId === node.id && activeDropdown.type === 'role-video-model' ? null : { nodeId: node.id, type: 'role-video-model' }); }}
                                                         className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-xs border transition-colors ${theme === 'dark'
                                                             ? 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:border-zinc-600'
-                                                            : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
+                                                            : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 hover:border-[#d7cfb2]' : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
                                                             }`}
                                                         onMouseDown={(e) => e.stopPropagation()}
                                                     >
@@ -17857,7 +18187,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     onChange={(e) => updateNodeSettings(node.id, { duration: e.target.value })}
                                                     className={`w-full px-2 py-1 rounded text-xs border ${theme === 'dark'
                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200'
-                                                        : 'bg-white border-zinc-300 text-zinc-800'
+                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                         }`}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                 >
@@ -17874,7 +18204,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     onChange={(e) => updateNodeSettings(node.id, { ratio: e.target.value })}
                                                     className={`w-full px-2 py-1 rounded text-xs border ${theme === 'dark'
                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200'
-                                                        : 'bg-white border-zinc-300 text-zinc-800'
+                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                         }`}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                 >
@@ -17898,7 +18228,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     }}
                                                     className={`w-full px-2 py-1 rounded text-xs border ${theme === 'dark'
                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200'
-                                                        : 'bg-white border-zinc-300 text-zinc-800'
+                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                         }`}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                 >
@@ -17916,7 +18246,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     placeholder="输入视频生成提示词..."
                                                     className={`w-full h-20 resize-none outline-none text-sm p-2 rounded border ${theme === 'dark'
                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200 placeholder-zinc-500'
-                                                        : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
+                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
                                                         }`}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                 />
@@ -18026,7 +18356,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     ? latestCompleted.output_images
                                     : (latestCompleted?.mjImages?.length ? latestCompleted.mjImages : (resolvedUrl ? [resolvedUrl] : []));
                                 const selectedImageIndex = node.settings?.selectedImageIndex ?? null;
-                                const defaultImageModel = lastUsedImageModel || apiConfigs.find(c => c.type === 'Image')?.id || '';
+                                const defaultImageModel = lastUsedImageModel || apiConfigs.find(c => isImageModelType(c.type))?.id || '';
                                 const modelId = node.settings?.model || defaultImageModel;
 
                                 return (
@@ -18044,7 +18374,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         onClick={(e) => { e.stopPropagation(); setActiveDropdown(activeDropdown?.nodeId === node.id && activeDropdown.type === 'role-image-model' ? null : { nodeId: node.id, type: 'role-image-model' }); }}
                                                         className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-xs border transition-colors ${theme === 'dark'
                                                             ? 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:border-zinc-600'
-                                                            : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
+                                                            : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 hover:border-[#d7cfb2]' : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
                                                             }`}
                                                         onMouseDown={(e) => e.stopPropagation()}
                                                     >
@@ -18062,7 +18392,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         >
                                                             <div className={`w-24 border-r pr-1 max-h-80 overflow-y-auto custom-scrollbar flex flex-col ${theme === 'dark' ? 'border-zinc-700' : 'border-zinc-200'}`}>
                                                                 {Object.entries(groupedApiConfigs)
-                                                                    .filter(([, group]) => group.models.some(m => m.type === 'Image'))
+                                                                    .filter(([, group]) => group.models.some(m => isImageModelType(m.type)))
                                                                     .map(([providerKey, group]) => (
                                                                         <button
                                                                             key={providerKey}
@@ -18078,7 +18408,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             </div>
                                                             <div className="flex-1 pl-1 max-h-80 overflow-y-auto custom-scrollbar">
                                                                 {hoveredProvider && groupedApiConfigs[hoveredProvider]?.models
-                                                                    .filter(m => m.type === 'Image')
+                                                                    .filter(m => isImageModelType(m.type))
                                                                     .map((m) => (
                                                                         <button
                                                                             key={m.id}
@@ -18116,7 +18446,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     onChange={(e) => updateNodeSettings(node.id, { ratio: e.target.value })}
                                                     className={`w-full px-2 py-1 rounded text-xs border ${theme === 'dark'
                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200'
-                                                        : 'bg-white border-zinc-300 text-zinc-800'
+                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                         }`}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                 >
@@ -18133,7 +18463,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     onChange={(e) => updateNodeSettings(node.id, { resolution: e.target.value })}
                                                     className={`w-full px-2 py-1 rounded text-xs border ${theme === 'dark'
                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200'
-                                                        : 'bg-white border-zinc-300 text-zinc-800'
+                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                         }`}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                 >
@@ -18152,7 +18482,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     placeholder="输入图片生成提示词..."
                                                     className={`w-full h-20 resize-none outline-none text-sm p-2 rounded border ${theme === 'dark'
                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200 placeholder-zinc-500'
-                                                        : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
+                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
                                                         }`}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                 />
@@ -18234,7 +18564,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 onMouseDown={(e) => e.stopPropagation()}
                                                 onClick={() => {
                                                     const prompt = node.settings?.prompt || '';
-                                                    const modelId = node.settings?.model || lastUsedImageModel || apiConfigs.find(c => c.type === 'Image')?.id || '';
+                                                    const modelId = node.settings?.model || lastUsedImageModel || apiConfigs.find(c => isImageModelType(c.type))?.id || '';
                                                     if (!prompt && (!node.settings?.referenceImages || node.settings.referenceImages.length === 0)) {
                                                         alert('请先输入提示词或添加参考图');
                                                         return;
@@ -18288,7 +18618,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     onChange={(e) => updateNodeSettings(node.id, { name: e.target.value })}
                                                     className={`w-full px-2 py-1 rounded text-xs border ${theme === 'dark'
                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200'
-                                                        : 'bg-white border-zinc-300 text-zinc-800'
+                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                         }`}
                                                     placeholder={isCharacter ? "输入角色名称..." : "输入场景名称..."}
                                                     onMouseDown={(e) => e.stopPropagation()}
@@ -18306,7 +18636,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         onChange={(e) => updateNodeSettings(node.id, { startSecond: parseFloat(e.target.value) || 0 })}
                                                         className={`w-20 px-2 py-1 rounded text-xs border ${theme === 'dark'
                                                             ? 'bg-zinc-800 border-zinc-700 text-zinc-200'
-                                                            : 'bg-white border-zinc-300 text-zinc-800'
+                                                            : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                             }`}
                                                         onMouseDown={(e) => e.stopPropagation()}
                                                     />
@@ -18319,7 +18649,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         onChange={(e) => updateNodeSettings(node.id, { endSecond: parseFloat(e.target.value) || 0 })}
                                                         className={`w-20 px-2 py-1 rounded text-xs border ${theme === 'dark'
                                                             ? 'bg-zinc-800 border-zinc-700 text-zinc-200'
-                                                            : 'bg-white border-zinc-300 text-zinc-800'
+                                                            : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                             }`}
                                                         onMouseDown={(e) => e.stopPropagation()}
                                                     />
@@ -18517,7 +18847,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 value={node.settings?.serverUrl ?? ''}
                                                 onChange={(e) => updateNodeSettings(node.id, { serverUrl: e.target.value })}
                                                 placeholder={localServerUrl || 'http://127.0.0.1:9527'}
-                                                className={`flex-1 text-xs border rounded px-2 py-1.5 outline-none focus:border-blue-500 ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-300 placeholder-zinc-600' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
+                                                className={`flex-1 text-xs border rounded px-2 py-1.5 outline-none focus:border-blue-500 ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-300 placeholder-zinc-600' : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
                                                 onMouseDown={(e) => e.stopPropagation()}
                                             />
                                             <button
@@ -18539,7 +18869,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             value={node.settings?.subfolder || ''}
                                             onChange={(e) => updateNodeSettings(node.id, { subfolder: e.target.value })}
                                             placeholder="v1_characters"
-                                            className={`w-full text-xs border rounded px-2 py-1.5 outline-none focus:border-blue-500 ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-300 placeholder-zinc-600' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
+                                            className={`w-full text-xs border rounded px-2 py-1.5 outline-none focus:border-blue-500 ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-300 placeholder-zinc-600' : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
                                             onMouseDown={(e) => e.stopPropagation()}
                                         />
                                     </div>
@@ -18625,7 +18955,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                         <div
                             className={`relative w-full h-full flex flex-col items-center justify-center transition-colors pointer-events-auto drop-zone ${theme === 'dark'
                                 ? 'bg-zinc-900 group-hover:bg-zinc-800'
-                                : 'bg-zinc-100 group-hover:bg-zinc-200'
+                                : theme === 'solarized'
+                                    ? 'bg-[#eee8d5] group-hover:bg-[#e4dcc2]'
+                                    : 'bg-zinc-100 group-hover:bg-zinc-200'
                                 }`}
                             onDrop={(e) => handleDrop(node.id, e)}
                             onDragOver={handleDragOver}
@@ -18638,7 +18970,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         <video
                                             src={node.content}
                                             controls
-                                            className="w-full h-full object-contain bg-black/50"
+                                            className={`w-full h-full object-contain ${theme === 'dark'
+                                                ? 'bg-black/50'
+                                                : theme === 'solarized'
+                                                    ? 'bg-[#eee8d5]'
+                                                    : 'bg-zinc-100'
+                                                }`}
                                             draggable={false}
                                             style={{
                                                 imageRendering: view.zoom >= 1 ? 'auto' : 'crisp-edges',
@@ -18651,7 +18988,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     ) : (
                                         <img
                                             src={node.content}
-                                            className="w-full h-full object-contain bg-black/50"
+                                            className={`w-full h-full object-contain ${theme === 'dark'
+                                                ? 'bg-black/50'
+                                                : theme === 'solarized'
+                                                    ? 'bg-[#eee8d5]'
+                                                    : 'bg-zinc-100'
+                                                }`}
                                             draggable={false}
                                             loading="lazy"
                                             style={{
@@ -19187,7 +19529,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     placeholder="输入文字内容..."
                                     className={`w-full h-full resize-none outline-none text-sm p-2 rounded border ${theme === 'dark'
                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200 placeholder-zinc-500'
-                                        : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
+                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
                                         }`}
                                     onMouseDown={(e) => e.stopPropagation()}
                                 />
@@ -19259,7 +19601,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 </div>
 
                                                 {/* 模式选择切换按钮 */}
-                                                <div className={`flex items-center gap-2 p-1 rounded-lg border shadow-inner ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700' : 'bg-zinc-100 border-zinc-200'
+                                                <div className={`flex items-center gap-2 p-1 rounded-lg border shadow-inner ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700' : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-100 border-zinc-200'
                                                     }`}>
                                                     <button
                                                         onClick={() => updateNodeSettings(node.id, { analysisMode: 'manual' })}
@@ -19306,7 +19648,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     setLastUsedSegmentDuration(val.toString());
                                                                     try { localStorage.setItem('tapnow_last_segment_duration', val.toString()); } catch { }
                                                                 }}
-                                                                className={`w-16 px-2 py-1 text-[11px] rounded border ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-800'}`}
+                                                                className={`w-16 px-2 py-1 text-[11px] rounded border ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-300' : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'}`}
                                                                 onMouseDown={(e) => e.stopPropagation()}
                                                             />
                                                             <span className="text-[11px] text-zinc-500">秒</span>
@@ -19591,7 +19933,7 @@ ${inputText.substring(0, 15000)} ... (截断)
 
                                                                                 {/* MJ 提示词 */}
                                                                                 {kf.mj_prompt && (
-                                                                                    <div className={`p-2 rounded border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-600' : 'bg-zinc-50 border-zinc-200'}`}>
+                                                                                    <div className={`p-2 rounded border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-600' : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'}`}>
                                                                                         <div className="flex items-start justify-between gap-2">
                                                                                             <div className="flex-1">
                                                                                                 <div className="text-[9px] text-zinc-500 mb-1">Midjourney 提示词</div>
@@ -19675,7 +20017,7 @@ ${inputText.substring(0, 15000)} ... (截断)
 
                                                                                 {/* 即梦提示词 */}
                                                                                 {kf.jimeng_prompt && (
-                                                                                    <div className={`p-2 rounded border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-600' : 'bg-zinc-50 border-zinc-200'}`}>
+                                                                                    <div className={`p-2 rounded border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-600' : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'}`}>
                                                                                         <div className="flex items-start justify-between gap-2">
                                                                                             <div className="flex-1">
                                                                                                 <div className="text-[9px] text-zinc-500 mb-1">即梦提示词</div>
@@ -19836,8 +20178,8 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     className={`flex flex-col h-full rounded-xl overflow-hidden pointer-events-auto transition-colors flex-1 ${theme === 'dark'
                                         ? 'bg-zinc-950 border border-zinc-800'
                                         : theme === 'solarized'
-                                            ? 'bg-[#fdf6e3] border border-[#eee8d5]'
-                                            : 'bg-white border border-zinc-300 shadow-sm'
+                                            ? 'bg-[#fdf6e3] border border-[#ddd6c1]'
+                                        : 'bg-white border border-zinc-300 shadow-sm'
                                         }`}
                                     onMouseEnter={() => setIsMouseOverStoryboard(true)}
                                     onMouseLeave={() => setIsMouseOverStoryboard(false)}
@@ -19846,7 +20188,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     <div className={`px-4 py-3 border-b flex items-center shrink-0 flex-nowrap overflow-x-auto no-scrollbar ${theme === 'dark'
                                         ? 'bg-zinc-900 border-zinc-800'
                                         : theme === 'solarized'
-                                            ? 'bg-[#fdf6e3] border-[#eee8d5]'
+                                            ? 'bg-[#ddd6c1] border-[#ddd6c1]'
                                             : 'bg-zinc-50 border-zinc-200'
                                         }`}>
                                         <div className="flex items-center gap-1 shrink-0">
@@ -19902,7 +20244,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         e.stopPropagation();
                                                         // V3.7.19: 切换模式时更新所有镜头的模型为对应类型
                                                         const newMode = 'image';
-                                                        const defaultModel = localStorage.getItem('tapnow_last_image_model') || apiConfigs.find(c => c.type === 'Image')?.id || '';
+                                                        const defaultModel = localStorage.getItem('tapnow_last_image_model') || apiConfigs.find(c => isImageModelType(c.type))?.id || '';
                                                         const currentShots = node.settings?.shots || [];
                                                         // 只更新那些使用了错误类型模型的镜头
                                                         const updatedShots = currentShots.map(shot => {
@@ -19934,7 +20276,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         const updatedShots = currentShots.map(shot => {
                                                             const shotConfig = apiConfigs.find(c => c.id === shot.model);
                                                             // 如果当前模型是图片类型，则更新为视频模型
-                                                            if (!shotConfig || shotConfig.type === 'Image') {
+                                                            if (!shotConfig || isImageModelType(shotConfig.type)) {
                                                                 return { ...shot, model: defaultModel, duration: getDefaultDurationForModel(defaultModel) };
                                                             }
                                                             return shot;
@@ -20581,7 +20923,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     value={node.settings?.scriptText || ''}
                                                     onChange={(e) => updateNodeSettings(node.id, { scriptText: e.target.value })}
                                                     placeholder="格式: #1 第一个镜头描述 #2 第二个镜头描述 ..."
-                                                    className={`w-full h-24 p-2 text-xs rounded border resize-none overflow-y-auto custom-scrollbar ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-200 placeholder-zinc-500' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
+                                                    className={`w-full h-24 p-2 text-xs rounded border resize-none overflow-y-auto custom-scrollbar ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-200 placeholder-zinc-500' : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                     onWheel={(e) => { e.stopPropagation(); }}
                                                 />
@@ -20711,7 +21053,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     // V3.7.27: 获取当前模式的默认模型
                                                                     const mode = node.settings?.mode || 'video';
                                                                     const defaultModel = mode === 'image'
-                                                                        ? (localStorage.getItem('tapnow_last_image_model') || apiConfigs.find(c => c.type === 'Image')?.id || '')
+                                                                        ? (localStorage.getItem('tapnow_last_image_model') || apiConfigs.find(c => isImageModelType(c.type))?.id || '')
                                                                         : (localStorage.getItem('tapnow_last_video_model') || apiConfigs.find(c => c.type === 'Video')?.id || '');
                                                                     const defaultRatio = mode === 'image' ? '1:1' : '16:9';
                                                                     const defaultDuration = mode === 'video' ? getDefaultDurationForModel(defaultModel) : undefined;
@@ -20850,7 +21192,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     ? 'border-blue-500 ring-1 ring-blue-500 bg-blue-500/5 z-10'
                                                                     : theme === 'dark'
                                                                         ? 'bg-zinc-900/50 border-zinc-800 hover:border-zinc-600'
-                                                                        : 'bg-white border-zinc-200 hover:border-blue-300 hover:shadow-md'
+                                                                        : theme === 'solarized'
+                                                                            ? 'bg-[#fdf6e3] border-[#eee8d5] hover:border-[#d7cfb2]'
+                                                                            : 'bg-white border-zinc-200 hover:border-blue-300 hover:shadow-md'
                                                                     }`}
                                                             >
                                                                 {/* Index */}
@@ -20873,8 +21217,16 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         const activeInput = shot.activeInput || 'first';
                                                                         const showMultiRef = shot.useMultiRef; // Toggle State
 
-                                                                        const borderColor = theme === 'dark' ? 'border-zinc-800' : 'border-zinc-300';
-                                                                        const bgColor = theme === 'dark' ? 'bg-black' : 'bg-zinc-50';
+                                                                        const borderColor = theme === 'dark'
+                                                                            ? 'border-zinc-800'
+                                                                            : theme === 'solarized'
+                                                                                ? 'border-[#eee8d5]'
+                                                                                : 'border-zinc-300';
+                                                                        const bgColor = theme === 'dark'
+                                                                            ? 'bg-black'
+                                                                            : theme === 'solarized'
+                                                                                ? 'bg-[#fdf6e3]'
+                                                                                : 'bg-zinc-50';
 
 
 
@@ -21070,7 +21422,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                 onMouseDown={(e) => e.stopPropagation()}
                                                                                 className={`flex items-center justify-between gap-1 px-2 py-1 rounded border text-xs transition-colors min-w-[100px] ${theme === 'dark'
                                                                                     ? 'bg-zinc-800 border-zinc-700 text-zinc-200 hover:border-zinc-600'
-                                                                                    : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
+                                                                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 hover:border-[#d7cfb2]' : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
                                                                                     }`}
                                                                             >
                                                                                 <span className="truncate font-mono text-[10px]">
@@ -21096,9 +21448,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                     <div className={`w-24 border-r pr-1 max-h-80 overflow-y-auto custom-scrollbar ${theme === 'dark' ? 'border-zinc-700' : 'border-zinc-200'}`}>
                                                                                         {(() => {
                                                                                             const mode = node.settings?.mode || 'video';
-                                                                                            const targetType = mode === 'image' ? 'Image' : 'Video';
+                                                                                            const isImageMode = mode === 'image';
                                                                                             return Object.entries(groupedApiConfigs)
-                                                                                                .filter(([, group]) => group.models.some(m => m.type === targetType))
+                                                                                                .filter(([, group]) => group.models.some(m => (isImageMode ? isImageModelType(m.type) : m.type === 'Video')))
                                                                                                 .map(([providerKey, group]) => (
                                                                                                     <button
                                                                                                         key={providerKey}
@@ -21117,9 +21469,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                     <div className="flex-1 pl-1 max-h-80 overflow-y-auto custom-scrollbar">
                                                                                         {(() => {
                                                                                             const mode = node.settings?.mode || 'video';
-                                                                                            const targetType = mode === 'image' ? 'Image' : 'Video';
+                                                                                            const isImageMode = mode === 'image';
                                                                                             return hoveredProvider && groupedApiConfigs[hoveredProvider]?.models
-                                                                                                .filter(m => m.type === targetType)
+                                                                                                .filter(m => (isImageMode ? isImageModelType(m.type) : m.type === 'Video'))
                                                                                                 .map((m) => (
                                                                                                     <button
                                                                                                         key={m.id}
@@ -21176,7 +21528,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                     onMouseDown={(e) => e.stopPropagation()}
                                                                                     className={`text-xs px-2 py-1 rounded border outline-none transition-colors ${theme === 'dark'
                                                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200 hover:border-zinc-600'
-                                                                                        : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
+                                                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 hover:border-[#d7cfb2]' : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
                                                                                         }`}
                                                                                 >
                                                                                     {ratioOptions.map(ratio => (
@@ -21206,7 +21558,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                         onMouseDown={(e) => e.stopPropagation()}
                                                                                         className={`text-xs px-2 py-1 rounded border outline-none transition-colors ${theme === 'dark'
                                                                                             ? 'bg-zinc-800 border-zinc-700 text-zinc-200 hover:border-zinc-600'
-                                                                                            : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
+                                                                                            : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 hover:border-[#d7cfb2]' : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
                                                                                             }`}
                                                                                         title="分辨率"
                                                                                     >
@@ -21232,7 +21584,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                         onMouseDown={(e) => e.stopPropagation()}
                                                                                         className={`text-xs px-2 py-1 rounded border outline-none transition-colors ${theme === 'dark'
                                                                                             ? 'bg-zinc-800 border-zinc-700 text-zinc-200 hover:border-zinc-600'
-                                                                                            : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
+                                                                                            : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 hover:border-[#d7cfb2]' : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
                                                                                             }`}
                                                                                         title="分辨率"
                                                                                     >
@@ -21258,7 +21610,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                     onMouseDown={(e) => e.stopPropagation()}
                                                                                     className={`text-xs px-2 py-1 rounded border outline-none transition-colors ${theme === 'dark'
                                                                                         ? 'bg-zinc-800 border-zinc-700 text-zinc-200 hover:border-zinc-600'
-                                                                                        : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
+                                                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 hover:border-[#d7cfb2]' : 'bg-white border-zinc-300 text-zinc-800 hover:border-zinc-400'
                                                                                         }`}
                                                                                 >
                                                                                     {availableDurations.map(duration => (
@@ -21318,6 +21670,20 @@ ${inputText.substring(0, 15000)} ... (截断)
 
                                                                     </div>
 
+                                                                    {(() => {
+                                                                        const customParamsView = renderCustomParamInputs(
+                                                                            shot.model,
+                                                                            shot.customParams,
+                                                                            (nextParams) => updateShot(node.id, shot.id, { customParams: nextParams })
+                                                                        );
+                                                                        if (!customParamsView) return null;
+                                                                        return (
+                                                                            <div className="mt-2" onMouseDown={(e) => e.stopPropagation()}>
+                                                                                {customParamsView}
+                                                                            </div>
+                                                                        );
+                                                                    })()}
+
                                                                     <textarea
                                                                         className={`text-sm outline-none resize-none bg-transparent transition-all ${theme === 'dark'
                                                                             ? 'text-zinc-200 placeholder:text-zinc-700'
@@ -21364,7 +21730,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     />
                                                                     <div className={`p-2 rounded text-xs font-mono border transition-all relative ${theme === 'dark'
                                                                         ? 'bg-zinc-950 border-zinc-800 text-zinc-400'
-                                                                        : 'bg-zinc-50 border-zinc-200 text-zinc-600'
+                                                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-600' : 'bg-zinc-50 border-zinc-200 text-zinc-600'
                                                                         }`}
                                                                         style={{
                                                                             minHeight: isActiveShot ? '8rem' : '2rem',
@@ -21971,7 +22337,11 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     </div>
 
                                     {/* Footer */}
-                                    <div className={`p-3 border-t shrink-0 ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800' : 'bg-zinc-50 border-zinc-200'
+                                    <div className={`p-3 border-t shrink-0 ${theme === 'dark'
+                                        ? 'bg-zinc-900 border-zinc-800'
+                                        : theme === 'solarized'
+                                            ? 'bg-[#ddd6c1] border-[#ddd6c1]'
+                                            : 'bg-zinc-50 border-zinc-200'
                                         }`}>
                                         <button
                                             onClick={() => addEmptyShot(node.id)}
@@ -21996,6 +22366,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                             <ImageCompareView
                                 img1={connectedImages[0]}
                                 img2={connectedImages[1]}
+                                theme={theme}
                             />
                         </div>
                     )
@@ -22260,7 +22631,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             ? 'bg-zinc-950/50 border-zinc-800'
                                             : theme === 'solarized'
                                                 ? 'bg-[#fdf6e3] border-[#eee8d5]'
-                                                : 'bg-zinc-50 border-zinc-200'
+                                                : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
                                             }`}
                                     >
                                         {/* 蒙版已连接状态提示（仅 gen-image 节点） */}
@@ -22572,7 +22943,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         onMouseDown={(e) => e.stopPropagation()}
                                                         className={`flex-1 px-2 py-1 rounded text-[10px] border outline-none focus:border-blue-500/50 ${theme === 'dark'
                                                             ? 'bg-zinc-900/50 border-zinc-700 text-zinc-300 placeholder-zinc-600'
-                                                            : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
+                                                            : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
                                                             }`}
                                                     />
                                                 </div>
@@ -22695,6 +23066,19 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             )}
                                         </div>
                                     )}
+                                    {(() => {
+                                        const customParamsView = renderCustomParamInputs(
+                                            node.settings?.model,
+                                            node.settings?.customParams,
+                                            (nextParams) => updateNodeSettings(node.id, { customParams: nextParams })
+                                        );
+                                        if (!customParamsView) return null;
+                                        return (
+                                            <div className="mb-2">
+                                                {customParamsView}
+                                            </div>
+                                        );
+                                    })()}
                                     <div
                                         className={`mt-auto pt-2 flex items-center justify-between shrink-0 relative gap-2 border-t ${theme === 'dark' ? 'border-zinc-800/50' : 'border-zinc-200'
                                             }`}
@@ -22723,7 +23107,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     {/* V3.4.6: 左侧 Provider 列表 */}
                                                     <div className={`w-36 border-r pr-1 max-h-64 overflow-y-auto custom-scrollbar flex flex-col justify-end ${theme === 'dark' ? 'border-zinc-700' : 'border-zinc-200'}`}>
                                                         {Object.entries(groupedApiConfigs)
-                                                            .filter(([, group]) => group.models.some(m => m.type === (node.type === 'gen-image' ? 'Image' : 'Video')))
+                                                            .filter(([, group]) => group.models.some(m => (node.type === 'gen-image' ? isImageModelType(m.type) : m.type === 'Video')))
                                                             .map(([providerKey, group]) => (
                                                                 <button
                                                                     key={providerKey}
@@ -22741,7 +23125,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     {/* V3.4.6: 右侧 Model 列表 */}
                                                     <div className="flex-1 pl-1 max-h-64 overflow-y-auto custom-scrollbar flex flex-col justify-end">
                                                         {hoveredProvider && groupedApiConfigs[hoveredProvider]?.models
-                                                            .filter(m => m.type === (node.type === 'gen-image' ? 'Image' : 'Video'))
+                                                            .filter(m => (node.type === 'gen-image' ? isImageModelType(m.type) : m.type === 'Video'))
                                                             .map((m) => (
                                                                 <button
                                                                     key={m.id}
@@ -23101,7 +23485,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             const basePrompt = node.type === 'gen-image' ? node.settings?.prompt || '' : node.settings?.videoPrompt || '';
                                             const connectedTexts = getConnectedTextNodes(node.id);
                                             const finalPrompt = connectedTexts.length > 0 ? connectedTexts.join(' ') + (basePrompt ? ' ' + basePrompt : '') : basePrompt;
-                                            startGeneration(finalPrompt, node.type === 'gen-image' ? 'image' : 'video', connectedImages, node.id);
+                                            startGeneration(finalPrompt, node.type === 'gen-image' ? 'image' : 'video', connectedImages, node.id, {
+                                                customParams: node.settings?.customParams
+                                            });
                                         }} className="bg-blue-600 hover:bg-blue-500 text-white p-1.5 rounded-md shadow-lg active:scale-95 transition-transform shrink-0" title="生成">
                                             <Play size={12} fill="currentColor" />
                                         </button>
@@ -23184,7 +23570,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 }}
                                 className={`ml-2 px-2 py-0.5 text-xs border rounded outline-none ${theme === 'dark'
                                     ? 'bg-zinc-800 border-zinc-700 text-zinc-200'
-                                    : 'bg-white border-zinc-300 text-zinc-800'
+                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                     }`}
                                 style={{ minWidth: '100px', maxWidth: '200px' }}
                             />
@@ -23291,7 +23677,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     ? 'bg-zinc-900/50 border-zinc-800 text-zinc-600 cursor-not-allowed'
                                     : theme === 'solarized'
                                         ? 'bg-[#616161]/60 border-[#525252] text-[#fdf6e3]/60 cursor-not-allowed'
-                                        : 'bg-zinc-50 border-zinc-200 text-zinc-400 cursor-not-allowed'
+                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-400 cursor-not-allowed' : 'bg-zinc-50 border-zinc-200 text-zinc-400 cursor-not-allowed'
                                 : theme === 'dark'
                                     ? 'bg-zinc-900 border-zinc-700 text-zinc-200 hover:bg-zinc-800'
                                     : theme === 'solarized'
@@ -23310,7 +23696,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     ? 'bg-zinc-900/50 border-zinc-800 text-zinc-600 cursor-not-allowed'
                                     : theme === 'solarized'
                                         ? 'bg-[#616161]/60 border-[#525252] text-[#fdf6e3]/60 cursor-not-allowed'
-                                        : 'bg-zinc-50 border-zinc-200 text-zinc-400 cursor-not-allowed'
+                                        : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-400 cursor-not-allowed' : 'bg-zinc-50 border-zinc-200 text-zinc-400 cursor-not-allowed'
                                 : theme === 'dark'
                                     ? 'bg-zinc-900 border-zinc-700 text-zinc-200 hover:bg-zinc-800'
                                     : theme === 'solarized'
@@ -23441,7 +23827,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 ? 'bg-[#121214] border-zinc-800'
                                 : theme === 'solarized'
                                     ? 'bg-[#fdf6e3] border-[#d7cfb2]'
-                                    : 'bg-zinc-50 border-zinc-200'
+                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
                                 }`}
                         >
                             <div
@@ -23723,7 +24109,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         createdAt: Date.now(),
                                                         mode: item.mode,
                                                         taskIndex: item.taskIndex || 0,
-                                                        shotIds: []
+                                                        shotIds: [],
+                                                        queued: [],
+                                                        running: []
                                                     });
                                                 }
                                                 return groupMap.get(fallbackId);
@@ -23897,7 +24285,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             }
                                                         }}
                                                         placeholder="默认使用 history"
-                                                        className={`flex-1 text-xs border rounded px-2 py-1.5 outline-none focus:border-blue-500 ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-300 placeholder-zinc-600' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
+                                                        className={`flex-1 text-xs border rounded px-2 py-1.5 outline-none focus:border-blue-500 ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-300 placeholder-zinc-600' : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
                                                     />
                                                     <button
                                                         onClick={() => pickLocalCachePath('imageSavePath', 'image_save_path')}
@@ -23924,7 +24312,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             }
                                                         }}
                                                         placeholder="默认使用 history"
-                                                        className={`flex-1 text-xs border rounded px-2 py-1.5 outline-none focus:border-blue-500 ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-300 placeholder-zinc-600' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
+                                                        className={`flex-1 text-xs border rounded px-2 py-1.5 outline-none focus:border-blue-500 ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700 text-zinc-300 placeholder-zinc-600' : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'}`}
                                                     />
                                                     <button
                                                         onClick={() => pickLocalCachePath('videoSavePath', 'video_save_path')}
@@ -24172,7 +24560,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 ? 'bg-[#121214] border-zinc-800'
                                 : theme === 'solarized'
                                     ? 'bg-[#eee8d5] border-[#d7cfb2]'
-                                    : 'bg-zinc-50 border-zinc-200'
+                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
                                 }`}
                         >
                             <div
@@ -24377,7 +24765,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 placeholder="输入视频 URL..."
                                                 className={`w-full px-3 py-2 text-xs rounded border outline-none ${theme === 'dark'
                                                     ? 'bg-zinc-900 border-zinc-700 text-zinc-200 placeholder-zinc-600'
-                                                    : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
+                                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
                                                     }`}
                                             />
                                         ) : (
@@ -24400,7 +24788,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 }}
                                                 className={`w-full px-3 py-2 text-xs rounded border outline-none ${theme === 'dark'
                                                     ? 'bg-zinc-900 border-zinc-700 text-zinc-200'
-                                                    : 'bg-white border-zinc-300 text-zinc-800'
+                                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                     }`}
                                             >
                                                 <option value="">选择历史记录中的视频...</option>
@@ -24471,7 +24859,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 onChange={(e) => setCreateCharacterStartSecond(parseFloat(e.target.value) || 0)}
                                                 className={`w-20 px-2 py-1.5 text-xs rounded border outline-none ${theme === 'dark'
                                                     ? 'bg-zinc-900 border-zinc-700 text-zinc-200'
-                                                    : 'bg-white border-zinc-300 text-zinc-800'
+                                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                     }`}
                                             />
                                             <span className={`text-xs ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-500'}`}>到</span>
@@ -24483,7 +24871,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 onChange={(e) => setCreateCharacterEndSecond(parseFloat(e.target.value) || 0)}
                                                 className={`w-20 px-2 py-1.5 text-xs rounded border outline-none ${theme === 'dark'
                                                     ? 'bg-zinc-900 border-zinc-700 text-zinc-200'
-                                                    : 'bg-white border-zinc-300 text-zinc-800'
+                                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                                     }`}
                                             />
                                             <span className={`text-xs ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-500'}`}>
@@ -24505,7 +24893,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             placeholder="例如: https://your-domain.com/sora/v1/characters"
                                             className={`w-full px-3 py-2 text-xs rounded border outline-none font-mono ${theme === 'dark'
                                                 ? 'bg-zinc-900 border-zinc-700 text-zinc-200 placeholder-zinc-600'
-                                                : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
+                                                : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
                                                 }`}
                                             onFocus={(e) => {
                                                 // 如果为空，自动填充默认值
@@ -24924,7 +25312,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         <div
                                             className={`rounded-2xl rounded-tl-none px-4 py-2 border flex items-center ${theme === 'dark'
                                                 ? 'bg-zinc-800/50 border-zinc-800'
-                                                : 'bg-zinc-100 border-zinc-200'
+                                                : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-100 border-zinc-200'
                                                 }`}
                                         >
                                             <div className="flex gap-1">
@@ -25945,7 +26333,10 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                             ratioLimits: Array.isArray(entry.ratioLimits) ? entry.ratioLimits : null,
                                                                             resolutionLimits: Array.isArray(entry.resolutionLimits) ? entry.resolutionLimits : null,
                                                                             durations: Array.isArray(entry.durations) ? entry.durations : null,
-                                                                            videoResolutions: Array.isArray(entry.videoResolutions) ? entry.videoResolutions : null
+                                                                            videoResolutions: Array.isArray(entry.videoResolutions) ? entry.videoResolutions : null,
+                                                                            supportsFirstLastFrame: !!entry.supportsFirstLastFrame,
+                                                                            supportsHD: !!entry.supportsHD,
+                                                                            customParams: normalizeCustomParams(entry.customParams)
                                                                         }))
                                                                         .filter((entry) => entry.id);
                                                                     setModelLibrary(normalizedLibrary);
@@ -26084,7 +26475,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 ? 'bg-[#18181b] border-zinc-800'
                                                 : theme === 'solarized'
                                                     ? 'bg-[#fdf6e3] border-[#d7cfb2]'
-                                                    : 'bg-zinc-50 border-zinc-200'
+                                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
                                                 }`}>
                                         {/* Provider 标题行 (可折叠) */}
                                         <button
@@ -26336,6 +26727,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                             >
                                                                                 <option value="Chat">Chat</option>
                                                                                 <option value="Image">Image</option>
+                                                                                <option value="ChatImage">Chat Image</option>
                                                                                 <option value="Video">Video</option>
                                                                             </select>
                                                                             <select
@@ -26449,11 +26841,28 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         {modelLibrary.map((entry) => {
                                             const isEditing = editingLibraryModels.has(entry.id);
                                             const isCollapsed = collapsedLibraryModels.has(entry.id);
+                                            const isPreviewOpen = libraryPreviewModels.has(entry.id);
                                             const ratioAll = entry.ratioLimits === null;
                                             const ratioValues = Array.isArray(entry.ratioLimits) ? entry.ratioLimits : [];
                                             const resolutionValues = Array.isArray(entry.resolutionLimits) ? entry.resolutionLimits : [];
                                             const durationValues = Array.isArray(entry.durations) ? entry.durations : [];
                                             const videoResolutionValues = Array.isArray(entry.videoResolutions) ? entry.videoResolutions : [];
+                                            const customParams = Array.isArray(entry.customParams) ? entry.customParams : [];
+                                            const previewBase = {
+                                                model: entry.modelName || entry.id,
+                                                type: entry.type || 'Chat',
+                                                apiType: entry.apiType || 'openai'
+                                            };
+                                            if (isImageModelType(entry.type)) {
+                                                previewBase.ratio = ratioValues[0] || '1:1';
+                                                previewBase.size = resolutionValues[0] || '2K';
+                                            }
+                                            if (entry.type === 'Video') {
+                                                previewBase.ratio = ratioValues[0] || '16:9';
+                                                previewBase.duration = durationValues[0] || '5s';
+                                                previewBase.resolution = videoResolutionValues[0] || '720P';
+                                            }
+                                            const previewPayload = buildCustomParamPreviewPayload(previewBase, customParams);
                                             return (
                                                 <div key={entry.id} className={`rounded-lg border p-3 space-y-3 ${theme === 'dark'
                                                     ? 'bg-[#18181b] border-zinc-800'
@@ -26462,15 +26871,49 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         : 'bg-white border-zinc-200'
                                                     }`}>
                                                     <div className="flex items-start justify-between gap-2">
-                                                        <div>
-                                                            <div className={`text-xs font-medium ${theme === 'dark' ? 'text-zinc-200' : 'text-zinc-800'}`}>
-                                                                {entry.displayName || entry.modelName || entry.id}
+                                                        <div className="flex flex-col gap-1">
+                                                            <div className="flex items-center gap-2">
+                                                                <div className={`text-xs font-medium ${theme === 'dark' ? 'text-zinc-200' : 'text-zinc-800'}`}>
+                                                                    {entry.displayName || entry.modelName || entry.id}
+                                                                </div>
+                                                                {isEditing ? (
+                                                                    <select
+                                                                        value={entry.type || 'Chat'}
+                                                                        onChange={(e) => updateModelLibraryEntry(entry.id, { type: e.target.value })}
+                                                                        className={`text-[9px] px-1 py-0.5 rounded border outline-none ${theme === 'dark'
+                                                                            ? 'bg-zinc-900 border-zinc-700 text-zinc-300'
+                                                                            : 'bg-white border-zinc-300 text-zinc-700'
+                                                                            }`}
+                                                                        disabled={!isEditing}
+                                                                    >
+                                                                        <option value="Chat">Chat</option>
+                                                                        <option value="Image">Image</option>
+                                                                        <option value="ChatImage">Chat Image</option>
+                                                                        <option value="Video">Video</option>
+                                                                    </select>
+                                                                ) : (
+                                                                    <span className={`text-[9px] px-1.5 py-0.5 rounded ${theme === 'dark'
+                                                                        ? 'bg-zinc-800 text-zinc-300'
+                                                                        : theme === 'solarized'
+                                                                            ? 'bg-[#eee8d5] text-zinc-600'
+                                                                            : 'bg-zinc-100 text-zinc-600'
+                                                                        }`}>
+                                                                        {entry.type || 'Chat'}
+                                                                    </span>
+                                                                )}
                                                             </div>
                                                             <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
                                                                 系统调用模型ID：{entry.modelName || entry.id}
                                                             </div>
                                                         </div>
                                                         <div className="flex items-center gap-1">
+                                                            <button
+                                                                onClick={() => toggleLibraryPreview(entry.id)}
+                                                                className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
+                                                                title={isPreviewOpen ? '隐藏请求预览' : '查看请求预览'}
+                                                            >
+                                                                <Code size={12} className={isPreviewOpen ? 'text-blue-500' : ''} />
+                                                            </button>
                                                             <button
                                                                 onClick={() => toggleLibraryModelCollapse(entry.id)}
                                                                 className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
@@ -26498,7 +26941,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     {!isCollapsed && (
                                                         <>
                                                             <div className="grid grid-cols-12 gap-2 items-end">
-                                                                <div className="col-span-4 space-y-1">
+                                                                <div className="col-span-5 space-y-1">
                                                                     <label className={`text-[9px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>显示名（仅展示）</label>
                                                                     <input
                                                                         className={`w-full text-xs rounded px-2 py-1 border outline-none ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
@@ -26508,7 +26951,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         disabled={!isEditing}
                                                                     />
                                                                 </div>
-                                                                <div className="col-span-4 space-y-1">
+                                                                <div className="col-span-5 space-y-1">
                                                                     <label className={`text-[9px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>模型ID（系统调用）</label>
                                                                     <input
                                                                         className={`w-full text-xs rounded px-2 py-1 border outline-none ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
@@ -26531,22 +26974,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         <option value="modelscope">ModelScope</option>
                                                                     </select>
                                                                 </div>
-                                                                <div className="col-span-2 space-y-1">
-                                                                    <label className={`text-[9px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>模型类型</label>
-                                                                    <select
-                                                                        value={entry.type || 'Chat'}
-                                                                        onChange={(e) => updateModelLibraryEntry(entry.id, { type: e.target.value })}
-                                                                        className={`w-full text-[10px] rounded px-2 py-1 border outline-none ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
-                                                                        disabled={!isEditing}
-                                                                    >
-                                                                        <option value="Chat">Chat</option>
-                                                                        <option value="Image">Image</option>
-                                                                        <option value="Video">Video</option>
-                                                                    </select>
-                                                                </div>
                                                             </div>
 
-                                                            {entry.type === 'Image' && (
+                                                            {isImageModelType(entry.type) && (
                                                                 <div className="grid grid-cols-12 gap-2">
                                                                     <div className="col-span-6">
                                                                         <TagListEditor
@@ -26639,6 +27069,82 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                             <span>HD</span>
                                                                         </label>
                                                                     </div>
+                                                                </div>
+                                                            )}
+                                                            <div className="space-y-2">
+                                                                <div className="flex items-center justify-between">
+                                                                    <label className={`text-[9px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>自定义参数</label>
+                                                                    <button
+                                                                        onClick={() => addModelLibraryCustomParam(entry.id)}
+                                                                        disabled={!isEditing}
+                                                                        className={`text-[9px] px-1.5 py-0.5 rounded ${theme === 'dark'
+                                                                            ? 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                                                                            : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300'
+                                                                            } ${!isEditing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                                    >
+                                                                        + 添加参数
+                                                                    </button>
+                                                                </div>
+                                                                {customParams.length > 0 ? (
+                                                                    <div className="space-y-2">
+                                                                        {customParams.map((param) => (
+                                                                            <div key={param.id} className={`rounded-md border p-2 space-y-2 ${theme === 'dark'
+                                                                                ? 'bg-zinc-900/60 border-zinc-800'
+                                                                                : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
+                                                                                }`}>
+                                                                                <div className="flex items-center gap-2">
+                                                                                    <input
+                                                                                        value={param.name || ''}
+                                                                                        onChange={(e) => updateModelLibraryCustomParam(entry.id, param.id, { name: e.target.value })}
+                                                                                        placeholder="参数名（如 size / quality / model）"
+                                                                                        disabled={!isEditing}
+                                                                                        className={`flex-1 text-[10px] rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                                            ? 'bg-zinc-900 border-zinc-800 text-zinc-300 placeholder-zinc-600'
+                                                                                            : 'bg-white border-zinc-300 text-zinc-900 placeholder-zinc-400'
+                                                                                            }`}
+                                                                                    />
+                                                                                    <label className={`flex items-center gap-1 text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
+                                                                                        <input
+                                                                                            type="checkbox"
+                                                                                            checked={!!param.override}
+                                                                                            onChange={(e) => updateModelLibraryCustomParam(entry.id, param.id, { override: e.target.checked })}
+                                                                                            disabled={!isEditing}
+                                                                                        />
+                                                                                        <span>覆盖同名参数</span>
+                                                                                    </label>
+                                                                                    <button
+                                                                                        onClick={() => deleteModelLibraryCustomParam(entry.id, param.id)}
+                                                                                        disabled={!isEditing}
+                                                                                        className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-red-400' : 'text-zinc-400 hover:text-red-500'} ${!isEditing ? 'opacity-40 cursor-not-allowed' : ''}`}
+                                                                                        title="删除参数"
+                                                                                    >
+                                                                                        <Trash2 size={12} />
+                                                                                    </button>
+                                                                                </div>
+                                                                                <TagListEditor
+                                                                                    label="参数值"
+                                                                                    values={Array.isArray(param.values) ? param.values : []}
+                                                                                    onChange={(values) => updateModelLibraryCustomParam(entry.id, param.id, { values })}
+                                                                                    placeholder="例：1024x1024,2K,low,high"
+                                                                                    disabled={!isEditing}
+                                                                                    theme={theme}
+                                                                                />
+                                                                            </div>
+                                                                        ))}
+                                                                    </div>
+                                                                ) : (
+                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-400'}`}>未设置自定义参数</div>
+                                                                )}
+                                                            </div>
+                                                            {isPreviewOpen && (
+                                                                <div className={`rounded-md border p-2 ${theme === 'dark'
+                                                                    ? 'bg-zinc-950/60 border-zinc-800'
+                                                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
+                                                                    }`}>
+                                                                    <div className={`text-[9px] mb-1 ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>请求预览（示例）</div>
+                                                                    <pre className={`text-[9px] whitespace-pre-wrap ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>
+                                                                        {JSON.stringify(previewPayload, null, 2)}
+                                                                    </pre>
                                                                 </div>
                                                             )}
                                                         </>
@@ -27080,3 +27586,4 @@ ${inputText.substring(0, 15000)} ... (截断)
 }
 
 export default TapnowApp;
+
