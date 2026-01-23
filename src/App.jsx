@@ -22015,7 +22015,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                     {supportsFirstLastFrame && (
                                                                                         <label className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border cursor-pointer transition-colors ${theme === 'dark'
                                                                                             ? shot.useFirstLastFrame ? 'bg-emerald-600/25 border-emerald-500 text-emerald-200' : 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
-                                                                                            : shot.useFirstLastFrame ? 'bg-emerald-500/20 border-emerald-300 text-emerald-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                                                            : theme === 'solarized'
+                                                                                                ? shot.useFirstLastFrame ? 'bg-[#eee8d5] border-[#d7cfb2] text-zinc-800' : 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
+                                                                                                : shot.useFirstLastFrame ? 'bg-emerald-500/20 border-emerald-300 text-emerald-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
                                                                                             }`} onClick={e => e.stopPropagation()}>
                                                                                             <input
                                                                                                 type="checkbox"
@@ -22033,7 +22035,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                     {supportsHD && (
                                                                                         <label className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border cursor-pointer transition-colors ${theme === 'dark'
                                                                                             ? shot.isHD ? 'bg-blue-600/30 border-blue-500 text-blue-300' : 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
-                                                                                            : shot.isHD ? 'bg-blue-500/30 border-blue-400 text-blue-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                                                            : theme === 'solarized'
+                                                                                                ? shot.isHD ? 'bg-[#eee8d5] border-[#d7cfb2] text-zinc-800' : 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
+                                                                                                : shot.isHD ? 'bg-blue-500/30 border-blue-400 text-blue-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
                                                                                             }`} onClick={e => e.stopPropagation()}>
                                                                                             <input
                                                                                                 type="checkbox"
@@ -23838,7 +23842,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'duration' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'duration' }); }}
                                                                     className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border ${theme === 'dark'
                                                                         ? 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
-                                                                        : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                                        : theme === 'solarized'
+                                                                            ? 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
+                                                                            : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
                                                                         }`}
                                                                 >
                                                                     {currentDuration}
@@ -23860,7 +23866,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                 }}
                                                                                 className={`w-full text-center py-1 text-[10px] rounded ${theme === 'dark'
                                                                                     ? 'text-zinc-300 hover:bg-zinc-800'
-                                                                                    : 'text-zinc-700 hover:bg-zinc-100'
+                                                                                    : theme === 'solarized' ? 'text-zinc-700 hover:bg-[#fdf6e3]' : 'text-zinc-700 hover:bg-zinc-100'
                                                                                     }`}
                                                                             >
                                                                                 {d}
@@ -23873,7 +23879,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             {node.type === 'gen-video' && currentModel?.supportsHD && (
                                                                 <label className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border cursor-pointer transition-colors ${theme === 'dark'
                                                                     ? node.settings?.isHD ? 'bg-blue-600/30 border-blue-500 text-blue-300' : 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
-                                                                    : node.settings?.isHD ? 'bg-blue-500/30 border-blue-400 text-blue-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                                    : theme === 'solarized'
+                                                                        ? node.settings?.isHD ? 'bg-[#eee8d5] border-[#d7cfb2] text-zinc-800' : 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
+                                                                        : node.settings?.isHD ? 'bg-blue-500/30 border-blue-400 text-blue-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
                                                                     }`} onClick={e => e.stopPropagation()}>
                                                                     <input
                                                                         type="checkbox"
@@ -23895,7 +23903,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                 return (
                                                                     <label className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border cursor-pointer transition-colors ${theme === 'dark'
                                                                         ? useFirstLastFrame ? 'bg-emerald-600/25 border-emerald-500 text-emerald-200' : 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
-                                                                        : useFirstLastFrame ? 'bg-emerald-500/20 border-emerald-300 text-emerald-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                                        : theme === 'solarized'
+                                                                            ? useFirstLastFrame ? 'bg-[#eee8d5] border-[#d7cfb2] text-zinc-800' : 'bg-[#fdf6e3] hover:bg-[#eee8d5] text-zinc-700 border-[#d7cfb2]'
+                                                                            : useFirstLastFrame ? 'bg-emerald-500/20 border-emerald-300 text-emerald-700' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
                                                                         }`} onClick={e => e.stopPropagation()}>
                                                                         <input
                                                                             type="checkbox"
