@@ -330,6 +330,26 @@ const LocalImageManager = (() => {
 // Expose for debugging
 window.LocalImageManager = LocalImageManager;
 
+const normalizeDataUrl = (value) => {
+    if (!value || typeof value !== 'string') return value;
+    if (!value.startsWith('data:')) return value;
+    return value.replace(/\s+/g, '');
+};
+
+const dataUrlToBlob = (dataUrl) => {
+    const normalized = normalizeDataUrl(dataUrl);
+    const match = normalized.match(/^data:([^;]+);base64,(.*)$/i);
+    if (!match) throw new Error('Invalid data URL');
+    const mime = match[1];
+    const base64 = match[2];
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: mime });
+};
+
 // --- LazyBase64Image 组件：将 Base64 转换为 Blob URL 的智能图片组件 ---
 const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => {
     const [blobUrl, setBlobUrl] = useState(null);
@@ -371,17 +391,16 @@ const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => 
 
         // 如果是 Base64 Data URL，转换为 Blob URL
         if (src.startsWith('data:')) {
+            const normalized = normalizeDataUrl(src);
             const convertToBlobUrl = async () => {
                 try {
-                    const res = await fetch(src);
-                    const blob = await res.blob();
+                    const blob = dataUrlToBlob(normalized);
                     const url = URL.createObjectURL(blob);
                     blobUrlRef.current = url;
                     setBlobUrl(url);
                 } catch (err) {
                     console.error('Base64转Blob失败', err);
-                    setError(true);
-                    setBlobUrl(src); // 失败时使用原始数据
+                    setBlobUrl(normalized); // 失败时使用原始数据
                 }
             };
             convertToBlobUrl();
@@ -3290,6 +3309,7 @@ function TapnowApp() {
     const localCacheCheckRef = useRef(new Map());
     const cachedHistoryUrlRef = useRef(new Map());
     const localCachePathRef = useRef({ savePath: '', imageSavePath: '', videoSavePath: '' });
+    const cacheFetchFailureRef = useRef(new Map());
 
     // 持久化性能模式和本地服务器设置
     useEffect(() => {
@@ -3754,6 +3774,46 @@ function TapnowApp() {
         return `${base}/proxy?url=${encodeURIComponent(rawUrl)}`;
     }, [localServerUrl]);
 
+    const CACHE_FETCH_RETRY_MS = 5 * 60 * 1000;
+    const getCacheFailureKey = useCallback((url) => {
+        if (!url) return '';
+        try {
+            const parsed = new URL(url);
+            return parsed.origin || url;
+        } catch (e) {
+            return url;
+        }
+    }, []);
+    const shouldSkipCacheFetch = useCallback((url) => {
+        if (!url) return false;
+        const key = getCacheFailureKey(url);
+        const lastFail = cacheFetchFailureRef.current.get(key);
+        return lastFail && (Date.now() - lastFail < CACHE_FETCH_RETRY_MS);
+    }, [getCacheFailureKey]);
+    const recordCacheFetchFailure = useCallback((url) => {
+        if (!url) return;
+        const key = getCacheFailureKey(url);
+        cacheFetchFailureRef.current.set(key, Date.now());
+    }, [getCacheFailureKey]);
+    const fetchCacheSource = useCallback(async (imageUrl) => {
+        const candidates = [imageUrl];
+        const proxied = resolveCacheFetchUrl(imageUrl);
+        if (proxied && proxied !== imageUrl) candidates.push(proxied);
+        let lastError;
+        for (const candidate of candidates) {
+            try {
+                const res = await fetch(candidate);
+                if (!res.ok) throw new Error(`缓存拉取失败: ${res.status}`);
+                const blob = await res.blob();
+                if (!blob || blob.size === 0) throw new Error('缓存拉取失败: 空文件');
+                return { blob, source: candidate };
+            } catch (err) {
+                lastError = err;
+            }
+        }
+        throw lastError || new Error('缓存拉取失败');
+    }, [resolveCacheFetchUrl]);
+
     const saveImageToLocalCache = useCallback(async (itemId, imageUrl, category = 'history', options = {}) => {
         if (!localCacheActive) return null;
         const baseUrl = (localServerUrl || '').replace(/\/+$/, '');
@@ -3764,19 +3824,15 @@ function TapnowApp() {
 
             let content = imageUrl;
             if (!imageUrl.startsWith('data:')) {
-                const res = await fetch(resolveCacheFetchUrl(imageUrl));
-                if (!res.ok) {
-                    throw new Error(`缓存拉取失败: ${res.status}`);
-                }
-                const blob = await res.blob();
-                if (!blob || blob.size === 0) {
-                    throw new Error('缓存拉取失败: 空文件');
-                }
+                if (shouldSkipCacheFetch(imageUrl)) return null;
+                const { blob } = await fetchCacheSource(imageUrl);
                 content = await new Promise((resolve) => {
                     const reader = new FileReader();
                     reader.onloadend = () => resolve(reader.result);
                     reader.readAsDataURL(blob);
                 });
+            } else {
+                content = normalizeDataUrl(imageUrl);
             }
             const ext = getDataUrlExt(content, getUrlExt(imageUrl, '.jpg'));
 
@@ -3792,10 +3848,13 @@ function TapnowApp() {
                 }
             }
         } catch (e) {
+            if (imageUrl && !imageUrl.startsWith('data:')) {
+                recordCacheFetchFailure(imageUrl);
+            }
             console.warn('[缓存] 保存图片缓存失败:', e);
         }
         return null;
-    }, [localCacheActive, localServerUrl, getCacheIdFromUrl, getDataUrlExt, getUrlExt, sanitizeCacheId, resolveCacheFetchUrl]);
+    }, [localCacheActive, localServerUrl, getCacheIdFromUrl, getDataUrlExt, getUrlExt, sanitizeCacheId, shouldSkipCacheFetch, fetchCacheSource, recordCacheFetchFailure]);
 
     const saveVideoToLocalCache = useCallback(async (itemId, videoUrl, category = 'history') => {
         if (!localCacheActive) return null;
@@ -3804,14 +3863,8 @@ function TapnowApp() {
         try {
             const saveId = getCacheIdFromUrl(videoUrl, itemId);
 
-            const res = await fetch(resolveCacheFetchUrl(videoUrl));
-            if (!res.ok) {
-                throw new Error(`缓存拉取失败: ${res.status}`);
-            }
-            const blob = await res.blob();
-            if (!blob || blob.size === 0) {
-                throw new Error('缓存拉取失败: 空文件');
-            }
+            if (shouldSkipCacheFetch(videoUrl)) return null;
+            const { blob } = await fetchCacheSource(videoUrl);
             const content = await new Promise((resolve) => {
                 const reader = new FileReader();
                 reader.onloadend = () => resolve(reader.result);
@@ -3831,10 +3884,11 @@ function TapnowApp() {
                 }
             }
         } catch (e) {
+            recordCacheFetchFailure(videoUrl);
             console.warn('[缓存] 保存视频缓存失败:', e);
         }
         return null;
-    }, [localCacheActive, localServerUrl, getCacheIdFromUrl, getDataUrlExt, getUrlExt, resolveCacheFetchUrl]);
+    }, [localCacheActive, localServerUrl, getCacheIdFromUrl, getDataUrlExt, getUrlExt, shouldSkipCacheFetch, fetchCacheSource, recordCacheFetchFailure]);
 
     const updateLocalCacheServerConfig = useCallback(async (patch, options = {}) => {
         const silent = options.silent === true;
@@ -3881,6 +3935,7 @@ function TapnowApp() {
         thumbnailCacheRef.current = new Map();
         localCacheCheckRef.current = new Map();
         cachedHistoryUrlRef.current = new Map();
+        cacheFetchFailureRef.current = new Map();
         setHistory(prev => prev.map(item => ({
             ...item,
             localCacheUrl: null,
@@ -4055,7 +4110,7 @@ function TapnowApp() {
         input.setAttribute('webkitdirectory', '');
         input.setAttribute('directory', '');
         input.multiple = true;
-        input.onchange = () => {
+        input.onchange = async () => {
             const file = input.files && input.files[0];
             if (!file) return;
             const rawPath = file.path || '';
@@ -4065,12 +4120,16 @@ function TapnowApp() {
             }
             const folderPath = rawPath.replace(/[\\/][^\\/]+$/, '');
             const normalized = normalizeLocalPath(folderPath);
-            setLocalServerConfig(prev => ({ ...prev, [fieldKey]: normalized }));
-            updateLocalCacheServerConfig({ [patchKey]: normalized }, { silent: true });
-            showToast('路径已更新', 'success', 2000);
+            const ok = await updateLocalCacheServerConfig({ [patchKey]: normalized }, { silent: true });
+            if (ok) {
+                showToast('路径已更新', 'success', 2000);
+                refreshLocalCache({ silent: true });
+            } else {
+                showToast('路径更新失败，请确认允许目录', 'error', 2000);
+            }
         };
         input.click();
-    }, [normalizeLocalPath, updateLocalCacheServerConfig, showToast]);
+    }, [normalizeLocalPath, updateLocalCacheServerConfig, showToast, refreshLocalCache]);
 
     // V2.6.1 Feature: 性能模式缩略图生成
     useEffect(() => {
@@ -7257,7 +7316,7 @@ function TapnowApp() {
             return await res.blob();
         };
         if (url.startsWith('data:')) {
-            return await fetchBlob(url);
+            return dataUrlToBlob(url);
         }
         if (url.startsWith('blob:')) {
             try {
@@ -7283,7 +7342,8 @@ function TapnowApp() {
     // 获取 Base64 字符串（自动识别 Data URL 或 Blob URL 并转换）
     const getBase64FromUrl = async (url) => {
         if (url.startsWith('data:')) {
-            return url.split(',')[1];
+            const normalized = normalizeDataUrl(url);
+            return normalized.split(',')[1];
         }
         const blob = await getBlobFromUrl(url);
         return new Promise((resolve, reject) => {
@@ -7319,8 +7379,7 @@ function TapnowApp() {
             }
             // 如果是 Base64 Data URL，转换为 Blob URL
             if (base64Data.startsWith('data:')) {
-                const res = await fetch(base64Data);
-                const blob = await res.blob();
+                const blob = dataUrlToBlob(base64Data);
                 return URL.createObjectURL(blob);
             }
             // 其他情况直接返回
@@ -25181,9 +25240,13 @@ ${inputText.substring(0, 15000)} ... (截断)
                             onDrop={handleCanvasDrop} onDragOver={handleCanvasDragOver}
                             style={{
                                 backgroundColor: theme === 'dark' ? '#09090b' : (theme === 'solarized' ? '#fdf6e3' : '#f4f4f5'),
-                                backgroundImage: 'radial-gradient(var(--canvas-grid-color) 1px, transparent 1px)',
-                                backgroundSize: '24px 24px',
-                                backgroundPosition: '0 0',
+                                backgroundImage: theme === 'dark'
+                                    ? 'radial-gradient(#27272a 1px, transparent 1px)'
+                                    : theme === 'solarized'
+                                        ? 'radial-gradient(#eee8d5 1px, transparent 1px)'
+                                        : 'radial-gradient(rgba(0, 0, 0, 0.08) 0.5px, transparent 0.5px)',
+                                backgroundSize: `${20 * view.zoom}px ${20 * view.zoom}px`,
+                                backgroundPosition: `${view.x}px ${view.y}px`,
                                 backgroundRepeat: 'repeat',
                                 WebkitFontSmoothing: 'antialiased',
                                 MozOsxFontSmoothing: 'grayscale',
