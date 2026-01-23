@@ -454,6 +454,26 @@ class TapnowHandler(BaseHTTPRequestHandler):
                 self.send_json_response({"success": True, "message": "已打开目录"})
             else:
                 self.send_json_response({"success": False, "message": "目录不存在"}, 404)
+
+        elif parsed.path == '/pick-path':
+            # 打开系统目录选择器，返回绝对路径
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    root.attributes('-topmost', True)
+                except Exception:
+                    pass
+                path = filedialog.askdirectory()
+                root.destroy()
+                if path:
+                    self.send_json_response({"success": True, "path": path})
+                else:
+                    self.send_json_response({"success": False, "message": "用户取消选择"})
+            except Exception as exc:
+                self.send_json_response({"success": False, "message": "无法打开目录选择器", "error": str(exc)}, 500)
         
         elif parsed.path == '/list-files':
             # 列出本地保存的所有文件（用于导入时匹配本地文件）

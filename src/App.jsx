@@ -336,18 +336,64 @@ const normalizeDataUrl = (value) => {
     return value.replace(/\s+/g, '');
 };
 
+const normalizeBase64Payload = (value) => {
+    if (!value) return '';
+    let cleaned = value.replace(/\s+/g, '');
+    if (/%[0-9A-Fa-f]{2}/.test(cleaned)) {
+        try {
+            cleaned = decodeURIComponent(cleaned);
+        } catch (e) {
+            // Keep original when decode fails.
+        }
+    }
+    cleaned = cleaned.replace(/-/g, '+').replace(/_/g, '/');
+    cleaned = cleaned.replace(/[^A-Za-z0-9+/=]/g, '');
+    const pad = cleaned.length % 4;
+    if (pad) cleaned += '='.repeat(4 - pad);
+    return cleaned;
+};
+
 const dataUrlToBlob = (dataUrl) => {
     const normalized = normalizeDataUrl(dataUrl);
-    const match = normalized.match(/^data:([^;]+);base64,(.*)$/i);
+    const match = normalized.match(/^data:([^;,]+)(;base64)?,(.*)$/i);
     if (!match) throw new Error('Invalid data URL');
-    const mime = match[1];
-    const base64 = match[2];
-    const binary = atob(base64);
+    const mime = match[1] || 'application/octet-stream';
+    const isBase64 = !!match[2];
+    let data = match[3] || '';
+    if (!isBase64) {
+        try {
+            return new Blob([decodeURIComponent(data)], { type: mime });
+        } catch (e) {
+            return new Blob([data], { type: mime });
+        }
+    }
+    data = normalizeBase64Payload(data);
+    let binary = '';
+    try {
+        binary = atob(data);
+    } catch (e) {
+        throw new Error('Invalid base64 payload');
+    }
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
     }
     return new Blob([bytes], { type: mime });
+};
+
+const truncateByBytes = (value, maxBytes) => {
+    if (!value || !maxBytes || maxBytes <= 0) return value || '';
+    const encoder = new TextEncoder();
+    let used = 0;
+    let output = '';
+    for (const ch of value) {
+        const size = encoder.encode(ch).length;
+        if (used + size > maxBytes) break;
+        output += ch;
+        used += size;
+    }
+    if (output.length < value.length) return `${output}...`;
+    return output;
 };
 
 // --- LazyBase64Image 组件：将 Base64 转换为 Blob URL 的智能图片组件 ---
@@ -358,6 +404,7 @@ const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => 
     const blobUrlRef = useRef(null);
 
     useEffect(() => {
+        setError(false);
         // 如果已经是 Blob URL 或 HTTP URL，直接使用
         if (!src || src.startsWith('blob:') || src.startsWith('http://') || src.startsWith('https://')) {
             setBlobUrl(src);
@@ -395,12 +442,14 @@ const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => 
             const convertToBlobUrl = async () => {
                 try {
                     const blob = dataUrlToBlob(normalized);
+                    if (!blob) throw new Error('Invalid data URL');
                     const url = URL.createObjectURL(blob);
                     blobUrlRef.current = url;
                     setBlobUrl(url);
                 } catch (err) {
                     console.error('Base64转Blob失败', err);
-                    setBlobUrl(normalized); // 失败时使用原始数据
+                    setError(true);
+                    setBlobUrl(null);
                 }
             };
             convertToBlobUrl();
@@ -518,6 +567,7 @@ const TagListEditor = ({
     onChange,
     placeholder,
     addLabel = '+',
+    formatItem = (value) => value,
     disabled = false,
     inputDisabled = false,
     theme = 'dark',
@@ -577,7 +627,7 @@ const TagListEditor = ({
                             : 'bg-zinc-100 text-zinc-600'
                             }`}
                     >
-                        {item}
+                        {formatItem(item)}
                         {!listDisabled && (
                             <button
                                 onClick={() => removeValue(item)}
@@ -692,6 +742,13 @@ const HistoryItem = memo(({
     const hasLocalCache = !!(localCacheActive && localCacheFallback);
     const thumbnailUrl = item.thumbnailUrl || null;
     const canDrag = item.status === 'completed' && (item.type === 'image' || (item.mjImages && item.mjImages.length > 0));
+    const rawModelName = (() => {
+        const fallback = item.apiConfig?.modelId || item.apiConfig?.model || item.model || item.modelName || '未知模型';
+        if (item.modelName && item.provider && item.modelName.toLowerCase() === item.provider.toLowerCase()) return fallback;
+        return item.modelName || fallback;
+    })();
+    const displayModelName = truncateByBytes(rawModelName, 15);
+    const providerTitle = item.provider || item.apiConfig?.provider || '';
     const getDisplayUrl = (originalUrl) => {
         if (hasLocalCache) return localCacheFallback;
         if (performanceMode !== 'off' && thumbnailUrl) return thumbnailUrl;
@@ -984,17 +1041,7 @@ const HistoryItem = memo(({
 
                     {/* 第四行 - 时间·模型·用时 */}
                     <span className={theme === 'dark' ? 'text-zinc-500' : theme === 'solarized' ? 'text-black' : 'text-zinc-400'}>
-                        {item.time} · <span title={(() => {
-                            const fallback = item.apiConfig?.modelId || item.apiConfig?.model || item.model || item.modelName || '未知模型';
-                            if (item.modelName && item.provider && item.modelName.toLowerCase() === item.provider.toLowerCase()) return fallback;
-                            return item.modelName || fallback;
-                        })()}>
-                            {(() => {
-                                const fallback = item.apiConfig?.modelId || item.apiConfig?.model || item.model || item.modelName || '未知模型';
-                                if (item.modelName && item.provider && item.modelName.toLowerCase() === item.provider.toLowerCase()) return fallback;
-                                return item.modelName || fallback;
-                            })()}
-                        </span>
+                        {item.time} · <span title={providerTitle || rawModelName}>{displayModelName}</span>
                         {typeof item.durationMs === 'number' && item.durationMs > 0 && (
                             <> · 用时 {(item.durationMs / 1000).toFixed(1)}s</>
                         )}
@@ -1773,6 +1820,17 @@ const normalizeVideoResolutionLower = (value) => {
     return normalized.toLowerCase();
 };
 const isImageModelType = (type) => type === 'Image' || type === 'ChatImage';
+const MAX_CUSTOM_PARAMS = 30;
+const normalizeCustomParamNotes = (notes) => {
+    if (!notes || typeof notes !== 'object') return {};
+    const next = {};
+    Object.entries(notes).forEach(([value, note]) => {
+        const key = String(value || '').trim();
+        const text = typeof note === 'string' ? note.trim() : '';
+        if (key && text) next[key] = text;
+    });
+    return next;
+};
 const normalizeCustomParams = (params) => {
     if (!Array.isArray(params)) return [];
     return params.map((param, index) => {
@@ -1787,7 +1845,8 @@ const normalizeCustomParams = (params) => {
             id,
             name,
             values,
-            override: !!param.override
+            override: !!param.override,
+            valueNotes: normalizeCustomParamNotes(param.valueNotes || param.valueLabels || param.notes)
         };
     }).filter(Boolean);
 };
@@ -1798,6 +1857,12 @@ const getCustomParamSelection = (param, selections) => {
     const byName = param.name && selections[param.name];
     if (byName !== undefined && byName !== null && byName !== '') return byName;
     return '';
+};
+const getCustomParamValueLabel = (param, value) => {
+    if (!value) return '';
+    const notes = param?.valueNotes || {};
+    const note = notes[value];
+    return note ? `${value}(${note})` : value;
 };
 const applyCustomParamsToPayload = (payload, customParams, selections) => {
     if (!payload || !Array.isArray(customParams) || customParams.length === 0) return payload;
@@ -1833,6 +1898,25 @@ const buildCustomParamPreviewPayload = (basePayload, customParams) => {
         }
     });
     return preview;
+};
+const getModelLibraryPreviewEndpoint = (entry) => {
+    if (!entry) return '/v1/images/generations';
+    if (entry.type === 'Video') return '/v1/videos/generations';
+    if (entry.type === 'Chat' || entry.type === 'ChatImage') return '/v1/chat/completions';
+    return '/v1/images/generations';
+};
+const buildPythonPreviewSnippet = (endpoint, payload) => {
+    const jsonText = JSON.stringify(payload || {}, null, 2);
+    return [
+        'import requests, json',
+        'BASE_URL = "https://api.example.com"',
+        'API_KEY = "YOUR_API_KEY"',
+        `url = f"{BASE_URL}${endpoint}"`,
+        'headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}',
+        `payload = json.loads('''${jsonText}''')`,
+        'resp = requests.post(url, headers=headers, json=payload)',
+        'print(resp.json())'
+    ].join('\n');
 };
 // 根据模型返回不同的分辨率选项
 const getDefaultResolutionsForModel = (modelId) => {
@@ -2497,14 +2581,7 @@ function TapnowApp() {
                     timestamp
                 };
                 const payload = JSON.stringify(saveData);
-                const shouldUseLocal = !autoSaveUseIdbRef.current && payload.length <= 4 * 1024 * 1024;
                 try {
-                    if (shouldUseLocal) {
-                        localStorage.setItem(AUTOSAVE_LOCAL_KEY, payload);
-                        writeAutoSaveMeta({ timestamp, storage: 'local' });
-                        console.log('[AutoSave] 自动保存完成', new Date().toLocaleTimeString());
-                        return;
-                    }
                     await writeAutoSaveToIdb(payload);
                     autoSaveUseIdbRef.current = true;
                     writeAutoSaveMeta({ timestamp, storage: 'idb' });
@@ -2512,18 +2589,13 @@ function TapnowApp() {
                     console.log('[AutoSave] 已写入 IndexedDB', new Date().toLocaleTimeString());
                 } catch (e) {
                     try {
-                        if (shouldUseLocal) {
-                            await writeAutoSaveToIdb(payload);
-                            autoSaveUseIdbRef.current = true;
-                            writeAutoSaveMeta({ timestamp, storage: 'idb' });
-                            try { localStorage.removeItem(AUTOSAVE_LOCAL_KEY); } catch (err) { }
-                            console.log('[AutoSave] 已切换 IndexedDB', new Date().toLocaleTimeString());
-                        } else {
-                            localStorage.setItem(AUTOSAVE_LOCAL_KEY, payload);
-                            autoSaveUseIdbRef.current = false;
-                            writeAutoSaveMeta({ timestamp, storage: 'local' });
-                            console.log('[AutoSave] IndexedDB 失败，已降级本地存储', new Date().toLocaleTimeString());
+                        if (payload.length > 4 * 1024 * 1024) {
+                            throw new Error('payload too large');
                         }
+                        localStorage.setItem(AUTOSAVE_LOCAL_KEY, payload);
+                        autoSaveUseIdbRef.current = false;
+                        writeAutoSaveMeta({ timestamp, storage: 'local' });
+                        console.log('[AutoSave] IndexedDB 失败，已降级本地存储', new Date().toLocaleTimeString());
                     } catch (err) {
                         console.warn('[AutoSave] 自动保存失败:', err.message || err);
                     }
@@ -3764,10 +3836,11 @@ function TapnowApp() {
         });
     }, []);
 
-    const resolveCacheFetchUrl = useCallback((rawUrl) => {
+    const resolveCacheFetchUrl = useCallback((rawUrl, useProxy = false) => {
         if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
         if (rawUrl.startsWith('data:') || rawUrl.startsWith('blob:')) return rawUrl;
         if (!/^https?:/i.test(rawUrl)) return rawUrl;
+        if (!useProxy) return rawUrl;
         const base = (localServerUrl || '').trim().replace(/\/+$/, '');
         if (!base) return rawUrl;
         if (rawUrl.startsWith(base)) return rawUrl;
@@ -3795,16 +3868,19 @@ function TapnowApp() {
         const key = getCacheFailureKey(url);
         cacheFetchFailureRef.current.set(key, Date.now());
     }, [getCacheFailureKey]);
-    const fetchCacheSource = useCallback(async (imageUrl) => {
+    const fetchCacheSource = useCallback(async (imageUrl, options = {}) => {
+        const useProxy = options.useProxy === true;
+        if (!imageUrl) throw new Error('缓存拉取失败: 空链接');
+        const isLocalData = imageUrl.startsWith('data:') || imageUrl.startsWith('blob:');
         const candidates = [imageUrl];
-        const proxied = resolveCacheFetchUrl(imageUrl);
-        if (proxied && proxied !== imageUrl) candidates.push(proxied);
+        if (!isLocalData) {
+            const proxied = resolveCacheFetchUrl(imageUrl, useProxy);
+            if (proxied && proxied !== imageUrl) candidates.push(proxied);
+        }
         let lastError;
         for (const candidate of candidates) {
             try {
-                const res = await fetch(candidate);
-                if (!res.ok) throw new Error(`缓存拉取失败: ${res.status}`);
-                const blob = await res.blob();
+                const blob = await getBlobFromUrl(candidate, { useProxy: false });
                 if (!blob || blob.size === 0) throw new Error('缓存拉取失败: 空文件');
                 return { blob, source: candidate };
             } catch (err) {
@@ -3812,12 +3888,13 @@ function TapnowApp() {
             }
         }
         throw lastError || new Error('缓存拉取失败');
-    }, [resolveCacheFetchUrl]);
+    }, [resolveCacheFetchUrl, getBlobFromUrl]);
 
     const saveImageToLocalCache = useCallback(async (itemId, imageUrl, category = 'history', options = {}) => {
         if (!localCacheActive) return null;
         const baseUrl = (localServerUrl || '').replace(/\/+$/, '');
         if (!baseUrl) return null;
+        const useProxy = options.useProxy === true;
         try {
             const forcedId = options?.forceId ? sanitizeCacheId(itemId || '') : '';
             const saveId = forcedId || getCacheIdFromUrl(imageUrl, itemId);
@@ -3825,7 +3902,7 @@ function TapnowApp() {
             let content = imageUrl;
             if (!imageUrl.startsWith('data:')) {
                 if (shouldSkipCacheFetch(imageUrl)) return null;
-                const { blob } = await fetchCacheSource(imageUrl);
+                const { blob } = await fetchCacheSource(imageUrl, { useProxy });
                 content = await new Promise((resolve) => {
                     const reader = new FileReader();
                     reader.onloadend = () => resolve(reader.result);
@@ -3856,15 +3933,16 @@ function TapnowApp() {
         return null;
     }, [localCacheActive, localServerUrl, getCacheIdFromUrl, getDataUrlExt, getUrlExt, sanitizeCacheId, shouldSkipCacheFetch, fetchCacheSource, recordCacheFetchFailure]);
 
-    const saveVideoToLocalCache = useCallback(async (itemId, videoUrl, category = 'history') => {
+    const saveVideoToLocalCache = useCallback(async (itemId, videoUrl, category = 'history', options = {}) => {
         if (!localCacheActive) return null;
         const baseUrl = (localServerUrl || '').replace(/\/+$/, '');
         if (!baseUrl) return null;
+        const useProxy = options.useProxy === true;
         try {
             const saveId = getCacheIdFromUrl(videoUrl, itemId);
 
             if (shouldSkipCacheFetch(videoUrl)) return null;
-            const { blob } = await fetchCacheSource(videoUrl);
+            const { blob } = await fetchCacheSource(videoUrl, { useProxy });
             const content = await new Promise((resolve) => {
                 const reader = new FileReader();
                 reader.onloadend = () => resolve(reader.result);
@@ -3952,6 +4030,12 @@ function TapnowApp() {
         }
     }, [showToast]);
 
+    const getItemProxyPreference = useCallback((item) => {
+        const providerKey = item?.provider || item?.apiConfig?.provider || '';
+        if (!providerKey) return false;
+        return !!providers[providerKey]?.useProxy;
+    }, [providers]);
+
     useEffect(() => {
         const nextPath = {
             savePath: localServerConfig.savePath || '',
@@ -4003,7 +4087,12 @@ function TapnowApp() {
         if (!item) return '';
         const preferHistoryPath = !!(localServerConfig.imageSavePath || localServerConfig.videoSavePath);
         const expectedSegment = preferHistoryPath ? '/file/history/' : '/file/.tapnow_cache/history/';
-        const isCacheUrlMismatch = (url) => url && expectedSegment && !String(url).includes(expectedSegment);
+        const isCacheUrlMismatch = (url) => {
+            if (!url) return false;
+            const text = String(url);
+            if (!text.includes('/file/')) return true;
+            return expectedSegment && !text.includes(expectedSegment);
+        };
         if (specificUrl) {
             if (localCacheActive && item.localCacheMap && item.localCacheMap[specificUrl]) {
                 const cached = item.localCacheMap[specificUrl];
@@ -4024,7 +4113,12 @@ function TapnowApp() {
         if (!item) return '';
         const preferHistoryPath = !!(localServerConfig.imageSavePath || localServerConfig.videoSavePath);
         const expectedSegment = preferHistoryPath ? '/file/history/' : '/file/.tapnow_cache/history/';
-        const isCacheUrlMismatch = (url) => url && expectedSegment && !String(url).includes(expectedSegment);
+        const isCacheUrlMismatch = (url) => {
+            if (!url) return false;
+            const text = String(url);
+            if (!text.includes('/file/')) return true;
+            return expectedSegment && !text.includes(expectedSegment);
+        };
         if (specificUrl) {
             if (localCacheActive && item.localCacheMap && item.localCacheMap[specificUrl]) {
                 const cached = item.localCacheMap[specificUrl];
@@ -4104,7 +4198,30 @@ function TapnowApp() {
         showToast('历史缩略图已全部重建', 'success');
     }, [history, rebuildHistoryThumbnail, showToast]);
 
-    const pickLocalCachePath = useCallback((fieldKey, patchKey) => {
+    const pickLocalCachePath = useCallback(async (fieldKey, patchKey) => {
+        const baseUrl = (localServerUrl || '').replace(/\/+$/, '');
+        if (baseUrl) {
+            try {
+                const res = await fetch(`${baseUrl}/pick-path`);
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data?.path) {
+                        const normalized = normalizeLocalPath(data.path);
+                        const ok = await updateLocalCacheServerConfig({ [patchKey]: normalized }, { silent: true });
+                        if (ok) {
+                            showToast('路径已更新', 'success', 2000);
+                            refreshLocalCache({ silent: true });
+                            return;
+                        }
+                        showToast('路径更新失败，请确认允许目录', 'error', 2000);
+                        return;
+                    }
+                }
+            } catch (e) {
+                // fallback to browser picker
+            }
+        }
+
         const input = document.createElement('input');
         input.type = 'file';
         input.setAttribute('webkitdirectory', '');
@@ -4129,7 +4246,7 @@ function TapnowApp() {
             }
         };
         input.click();
-    }, [normalizeLocalPath, updateLocalCacheServerConfig, showToast, refreshLocalCache]);
+    }, [localServerUrl, normalizeLocalPath, updateLocalCacheServerConfig, showToast, refreshLocalCache]);
 
     // V2.6.1 Feature: 性能模式缩略图生成
     useEffect(() => {
@@ -4218,10 +4335,16 @@ function TapnowApp() {
         const cacheHistoryImages = async () => {
             const preferHistoryPath = !!(localServerConfig.imageSavePath || localServerConfig.videoSavePath);
             const expectedSegment = preferHistoryPath ? '/file/history/' : '/file/.tapnow_cache/history/';
-            const isCacheUrlMismatch = (url) => url && expectedSegment && !String(url).includes(expectedSegment);
+            const isCacheUrlMismatch = (url) => {
+                if (!url) return false;
+                const text = String(url);
+                if (!text.includes('/file/')) return true;
+                return expectedSegment && !text.includes(expectedSegment);
+            };
 
             for (const item of history) {
                 if (item.status !== 'completed' || item.type !== 'image') continue;
+                const useProxy = getItemProxyPreference(item);
                 let localCacheUrl = item.localCacheUrl || null;
                 let localFilePath = item.localFilePath || null;
                 let cacheMap = item.localCacheMap ? { ...item.localCacheMap } : {};
@@ -4316,7 +4439,7 @@ function TapnowApp() {
                     }
 
                     try {
-                        const result = await saveImageToLocalCache(cacheId, imageUrl, 'history', { forceId: true });
+                        const result = await saveImageToLocalCache(cacheId, imageUrl, 'history', { forceId: true, useProxy });
                         if (result) {
                             cachedHistoryUrlRef.current.set(imageUrl, result.url);
                             cacheMap[imageUrl] = result.url;
@@ -4353,7 +4476,7 @@ function TapnowApp() {
 
         const timer = setTimeout(cacheHistoryImages, 3000);
         return () => clearTimeout(timer);
-    }, [history, localCacheActive, localServerConfig.imageSavePath, localServerConfig.videoSavePath, saveImageToLocalCache, sanitizeCacheId, getCacheIdFromUrl]);
+    }, [history, localCacheActive, localServerConfig.imageSavePath, localServerConfig.videoSavePath, saveImageToLocalCache, sanitizeCacheId, getCacheIdFromUrl, getItemProxyPreference]);
 
     // V2.6.1 Feature: 历史记录本地缓存（视频）
     useEffect(() => {
@@ -4362,9 +4485,15 @@ function TapnowApp() {
         const cacheHistoryVideos = async () => {
             const preferHistoryPath = !!localServerConfig.videoSavePath;
             const expectedSegment = preferHistoryPath ? '/file/history/' : '/file/.tapnow_cache/history/';
-            const isCacheUrlMismatch = (url) => url && expectedSegment && !String(url).includes(expectedSegment);
+            const isCacheUrlMismatch = (url) => {
+                if (!url) return false;
+                const text = String(url);
+                if (!text.includes('/file/')) return true;
+                return expectedSegment && !text.includes(expectedSegment);
+            };
             for (const item of history) {
                 if (item.status !== 'completed' || item.type !== 'video') continue;
+                const useProxy = getItemProxyPreference(item);
                 if (item.localCacheUrl && isCacheUrlMismatch(item.localCacheUrl)) {
                     setHistory(prev => prev.map(h =>
                         h.id === item.id ? { ...h, localCacheUrl: null, localFilePath: null } : h
@@ -4380,7 +4509,7 @@ function TapnowApp() {
                 if (!videoUrl || videoUrl.startsWith('blob:') || videoUrl.includes('...')) continue;
 
                 try {
-                    const result = await saveVideoToLocalCache(item.id, videoUrl, 'history');
+                    const result = await saveVideoToLocalCache(item.id, videoUrl, 'history', { useProxy });
                     if (result) {
                         setHistory(prev => prev.map(h =>
                             h.id === item.id ? { ...h, localCacheUrl: result.url, localFilePath: result.path } : h
@@ -4394,7 +4523,7 @@ function TapnowApp() {
 
         const timer = setTimeout(cacheHistoryVideos, 5000);
         return () => clearTimeout(timer);
-    }, [history, localCacheActive, localServerConfig.videoSavePath, saveVideoToLocalCache]);
+    }, [history, localCacheActive, localServerConfig.videoSavePath, saveVideoToLocalCache, getItemProxyPreference]);
 
     const canvasRef = useRef(null);
     const lastMousePos = useRef({ x: 0, y: 0 });
@@ -4928,7 +5057,7 @@ function TapnowApp() {
                                 >
                                     <option value="">不设置</option>
                                     {options.map(option => (
-                                        <option key={option} value={option}>{option}</option>
+                                        <option key={option} value={option}>{getCustomParamValueLabel(param, option)}</option>
                                     ))}
                                 </select>
                             ) : (
@@ -6723,11 +6852,16 @@ function TapnowApp() {
         setModelLibrary(prev => prev.map((entry) => {
             if (entry.id !== entryId) return entry;
             const nextParams = Array.isArray(entry.customParams) ? [...entry.customParams] : [];
+            if (nextParams.length >= MAX_CUSTOM_PARAMS) {
+                showToast(`自定义参数最多 ${MAX_CUSTOM_PARAMS} 个`, 'warning', 2000);
+                return entry;
+            }
             nextParams.push({
                 id: `param-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
                 name: '',
                 values: [],
-                override: false
+                override: false,
+                valueNotes: {}
             });
             return { ...entry, customParams: nextParams };
         }));
@@ -7308,8 +7442,9 @@ function TapnowApp() {
     };
 
     // 获取 Blob 对象（兼容 HTTP URL 和 Blob URL）
-    const getBlobFromUrl = async (url) => {
+    const getBlobFromUrl = async (url, options = {}) => {
         if (!url) throw new Error('Invalid URL');
+        const useProxy = options.useProxy === true;
         const fetchBlob = async (target) => {
             const res = await fetch(target);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -7326,7 +7461,7 @@ function TapnowApp() {
             }
         }
         const candidates = [url];
-        const proxied = resolveCacheFetchUrl(url);
+        const proxied = resolveCacheFetchUrl(url, useProxy);
         if (proxied && proxied !== url) candidates.push(proxied);
         let lastError;
         for (const candidate of candidates) {
@@ -7340,12 +7475,14 @@ function TapnowApp() {
     };
 
     // 获取 Base64 字符串（自动识别 Data URL 或 Blob URL 并转换）
-    const getBase64FromUrl = async (url) => {
+    const getBase64FromUrl = async (url, options = {}) => {
         if (url.startsWith('data:')) {
             const normalized = normalizeDataUrl(url);
-            return normalized.split(',')[1];
+            const blob = dataUrlToBlob(normalized);
+            const dataUrl = await blobToDataURL(blob);
+            return dataUrl.split(',')[1] || '';
         }
-        const blob = await getBlobFromUrl(url);
+        const blob = await getBlobFromUrl(url, options);
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onloadend = () => {
@@ -10260,7 +10397,7 @@ function TapnowApp() {
                     };
 
                     for (const img of inputImages) {
-                        const base64 = await getBase64FromUrl(img);
+                        const base64 = await getBase64FromUrl(img, { useProxy });
                         const mimeType = getGeminiMimeType(img);
                         parts.push({
                             inline_data: {
@@ -10297,7 +10434,7 @@ function TapnowApp() {
                     if (aspect) formData.append('aspect_ratio', aspect);
                     if (imageSizeFlag) formData.append('image_size', imageSizeFlag);
 
-                    const blobPromises = connectedImages.map(url => getBlobFromUrl(url));
+                    const blobPromises = connectedImages.map(url => getBlobFromUrl(url, { useProxy }));
                     const blobs = await Promise.all(blobPromises);
                     blobs.forEach((blob, i) => {
                         formData.append('image', blob, `input_${i}.png`);
@@ -10322,7 +10459,7 @@ function TapnowApp() {
 
                     const refs = connectedImages.length > 0 ? connectedImages : (sourceImage ? [sourceImage] : []);
                     if (refs.length > 0) {
-                        const blobPromises = refs.map(url => getBlobFromUrl(url));
+                        const blobPromises = refs.map(url => getBlobFromUrl(url, { useProxy }));
                         const blobs = await Promise.all(blobPromises);
                         blobs.forEach((blob, i) => formData.append('image', blob, `flux_ref_${i}.png`));
                     }
@@ -10344,7 +10481,7 @@ function TapnowApp() {
                     if (aspect) jsonBody.aspect_ratio = aspect;
 
                     if (connectedImages.length > 0) {
-                        const b64Promises = connectedImages.map(url => getBase64FromUrl(url));
+                        const b64Promises = connectedImages.map(url => getBase64FromUrl(url, { useProxy }));
                         const b64s = await Promise.all(b64Promises);
                         jsonBody.image = b64s.map(b => `data:image/png;base64,${b}`);
                     }
@@ -10363,7 +10500,7 @@ function TapnowApp() {
                         if (aspect) formData.append('aspect_ratio', aspect);
                         if (imageSizeFlag) formData.append('image_size', imageSizeFlag);
 
-                        const blobPromises = connectedImages.map(url => getBlobFromUrl(url));
+                        const blobPromises = connectedImages.map(url => getBlobFromUrl(url, { useProxy }));
                         const blobs = await Promise.all(blobPromises);
                         blobs.forEach((blob, i) => {
                             formData.append('image', blob, `input_${i}.png`);
@@ -10388,7 +10525,7 @@ function TapnowApp() {
                             } else if (trimmedImg.startsWith('data:')) {
                                 jsonBody.image = [trimmedImg];
                             } else {
-                                const b64 = await getBase64FromUrl(trimmedImg);
+                                const b64 = await getBase64FromUrl(trimmedImg, { useProxy });
                                 jsonBody.image = [`data:image/png;base64,${b64}`];
                             }
                         }
@@ -11100,13 +11237,13 @@ function TapnowApp() {
                                     if (trimmedImg.startsWith('data:')) {
                                         return trimmedImg;
                                     } else if (trimmedImg.startsWith('blob:')) {
-                                        const base64 = await getBase64FromUrl(trimmedImg);
-                                        return `data: image / png; base64, ${base64} `;
+                                        const base64 = await getBase64FromUrl(trimmedImg, { useProxy });
+                                        return `data:image/png;base64, ${base64} `;
                                     } else if (trimmedImg.length > 100 && !trimmedImg.includes('://') && !trimmedImg.startsWith('data:')) {
-                                        return `data: image / png; base64, ${trimmedImg} `;
+                                        return `data:image/png;base64, ${trimmedImg} `;
                                     } else {
-                                        const base64 = await getBase64FromUrl(trimmedImg);
-                                        return `data: image / png; base64, ${base64} `;
+                                        const base64 = await getBase64FromUrl(trimmedImg, { useProxy });
+                                        return `data:image/png;base64, ${base64} `;
                                     }
                                 } catch (e) {
                                     console.error('Veo: Failed to process image:', e);
@@ -11132,14 +11269,14 @@ function TapnowApp() {
                                 } else if (trimmedSource.startsWith('data:')) {
                                     images = [trimmedSource];
                                 } else if (trimmedSource.startsWith('blob:')) {
-                                    const base64 = await getBase64FromUrl(trimmedSource);
-                                    images = [`data: image / png; base64, ${base64} `];
+                                    const base64 = await getBase64FromUrl(trimmedSource, { useProxy });
+                                    images = [`data:image/png;base64, ${base64} `];
                                 } else {
                                     if (trimmedSource.length > 100 && !trimmedSource.includes('://') && !trimmedSource.startsWith('data:')) {
-                                        images = [`data: image / png; base64, ${trimmedSource} `];
+                                        images = [`data:image/png;base64, ${trimmedSource} `];
                                     } else {
-                                        const base64 = await getBase64FromUrl(trimmedSource);
-                                        images = [`data: image / png; base64, ${base64} `];
+                                        const base64 = await getBase64FromUrl(trimmedSource, { useProxy });
+                                        images = [`data:image/png;base64, ${base64} `];
                                     }
                                 }
                             }
@@ -11295,7 +11432,7 @@ function TapnowApp() {
                                 base64Data = sourceImage; // 已经是 Base64
                             } else {
                                 // 下载 blob 或 url 并转换
-                                const blob = await getBlobFromUrl(sourceImage);
+                                const blob = await getBlobFromUrl(sourceImage, { useProxy });
                                 base64Data = await new Promise((resolve, reject) => {
                                     const reader = new FileReader();
                                     reader.onloadend = () => resolve(reader.result);
@@ -11357,7 +11494,7 @@ function TapnowApp() {
                 // Generic Video Logic (Sora/Kling/etc) - Force Multipart for Image Input with correct field names
                 if (sourceImage) {
                     const formData = new FormData();
-                    const blob = await getBlobFromUrl(sourceImage);
+                    const blob = await getBlobFromUrl(sourceImage, { useProxy });
 
                     if (modelId.includes('sora')) {
                         endpoint = `${baseUrl} /v1/videos`;
@@ -11387,7 +11524,7 @@ function TapnowApp() {
                         const jimengResolution = normalizeVideoResolutionLower(resolution);
                         if (jimengResolution) formData.append('resolution', jimengResolution);
                         const jimengImages = connectedImages.filter(Boolean).slice(0, 2);
-                        const jimengBlobs = await Promise.all(jimengImages.map((img) => getBlobFromUrl(img)));
+                        const jimengBlobs = await Promise.all(jimengImages.map((img) => getBlobFromUrl(img, { useProxy })));
                         if (jimengBlobs[0]) formData.append('image_file_1', jimengBlobs[0], 'first.png');
                         if (jimengBlobs[1]) formData.append('image_file_2', jimengBlobs[1], 'last.png');
                     } else if (modelId.includes('grok')) {
@@ -11803,7 +11940,7 @@ function TapnowApp() {
                     try {
                         const b64 = await getBase64FromUrl(nodeCopy.content);
                         const mime = isVideoUrl(nodeCopy.content) ? 'video/mp4' : 'image/png';
-                        nodeCopy.content = `data:${mime}; base64, ${b64} `;
+                        nodeCopy.content = `data:${mime};base64,${b64}`;
                     } catch (e) {
                         console.error('转换节点 content 失败:', e);
                     }
@@ -11813,7 +11950,7 @@ function TapnowApp() {
                 if (nodeCopy.maskContent && typeof nodeCopy.maskContent === 'string' && nodeCopy.maskContent.startsWith('blob:')) {
                     try {
                         const b64 = await getBase64FromUrl(nodeCopy.maskContent);
-                        nodeCopy.maskContent = `data: image / png; base64, ${b64} `;
+                        nodeCopy.maskContent = `data:image/png;base64, ${b64} `;
                     } catch (e) {
                         console.error('转换节点 maskContent 失败:', e);
                     }
@@ -11826,7 +11963,7 @@ function TapnowApp() {
                         if (frame && frame.url && typeof frame.url === 'string' && frame.url.startsWith('blob:')) {
                             try {
                                 const b64 = await getBase64FromUrl(frame.url);
-                                frame.url = `data: image / png; base64, ${b64} `;
+                                frame.url = `data:image/png;base64, ${b64} `;
                             } catch (e) {
                                 console.error('转换关键帧失败:', e);
                             }
@@ -11841,7 +11978,7 @@ function TapnowApp() {
                         if (frame && frame.url && typeof frame.url === 'string' && frame.url.startsWith('blob:')) {
                             try {
                                 const b64 = await getBase64FromUrl(frame.url);
-                                frame.url = `data: image / png; base64, ${b64} `;
+                                frame.url = `data:image/png;base64, ${b64} `;
                             } catch (e) {
                                 console.error('转换帧失败:', e);
                             }
@@ -11876,7 +12013,7 @@ function TapnowApp() {
                     try {
                         const b64 = await getBase64FromUrl(itemCopy.url);
                         const mime = itemCopy.type === 'video' ? 'video/mp4' : 'image/png';
-                        itemCopy.url = `data:${mime}; base64, ${b64} `;
+                        itemCopy.url = `data:${mime};base64,${b64}`;
                     } catch (e) {
                         console.error('转换历史记录 url 失败:', e);
                     }
@@ -11886,7 +12023,7 @@ function TapnowApp() {
                 if (itemCopy.mjOriginalUrl && typeof itemCopy.mjOriginalUrl === 'string' && itemCopy.mjOriginalUrl.startsWith('blob:')) {
                     try {
                         const b64 = await getBase64FromUrl(itemCopy.mjOriginalUrl);
-                        itemCopy.mjOriginalUrl = `data: image / png; base64, ${b64} `;
+                        itemCopy.mjOriginalUrl = `data:image/png;base64, ${b64} `;
                     } catch (e) {
                         console.error('转换 mjOriginalUrl 失败:', e);
                     }
@@ -11899,7 +12036,7 @@ function TapnowApp() {
                         if (imgUrl && typeof imgUrl === 'string' && imgUrl.startsWith('blob:')) {
                             try {
                                 const b64 = await getBase64FromUrl(imgUrl);
-                                itemCopy.mjImages[i] = `data: image / png; base64, ${b64} `;
+                                itemCopy.mjImages[i] = `data:image/png;base64, ${b64} `;
                             } catch (e) {
                                 console.error('转换 mjImages 失败:', e);
                             }
@@ -11918,7 +12055,7 @@ function TapnowApp() {
                 if (charCopy.avatar && typeof charCopy.avatar === 'string' && charCopy.avatar.startsWith('blob:')) {
                     try {
                         const b64 = await getBase64FromUrl(charCopy.avatar);
-                        charCopy.avatar = `data: image / png; base64, ${b64} `;
+                        charCopy.avatar = `data:image/png;base64, ${b64} `;
                     } catch (e) {
                         console.error('转换角色 avatar 失败:', e);
                     }
@@ -11928,7 +12065,7 @@ function TapnowApp() {
                 if (charCopy.profile_picture_url && typeof charCopy.profile_picture_url === 'string' && charCopy.profile_picture_url.startsWith('blob:')) {
                     try {
                         const b64 = await getBase64FromUrl(charCopy.profile_picture_url);
-                        charCopy.profile_picture_url = `data: image / png; base64, ${b64} `;
+                        charCopy.profile_picture_url = `data:image/png;base64, ${b64} `;
                     } catch (e) {
                         console.error('转换角色 profile_picture_url 失败:', e);
                     }
@@ -19352,7 +19489,10 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         />
                                     </div>
                                     <label
-                                        className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer pointer-events-auto"
+                                        className={`px-4 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer pointer-events-auto ${theme === 'solarized'
+                                            ? 'bg-[#616161] hover:bg-[#4b4b4b] text-white'
+                                            : 'bg-blue-600 hover:bg-blue-500 text-white'
+                                            }`}
                                         onMouseDown={(e) => e.stopPropagation()}
                                     >
                                         选择图片
@@ -22280,7 +22420,11 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             {/* V3.7.10: 右侧预览面板 - 4图网格 */}
                                                             {node.settings?.showOutputPreview && (
                                                                 <div
-                                                                    className={`shrink-0 p-2 ml-1 flex flex-col gap-2 rounded-lg border transition-all ${theme === 'dark' ? 'bg-zinc-900/50 border-zinc-800' : 'bg-white border-zinc-200'
+                                                                    className={`shrink-0 p-2 ml-1 flex flex-col gap-2 rounded-lg border transition-all ${theme === 'dark'
+                                                                        ? 'bg-zinc-900/50 border-zinc-800'
+                                                                        : theme === 'solarized'
+                                                                            ? 'bg-[#fdf6e3] border-[#d7cfb2]'
+                                                                            : 'bg-white border-zinc-200'
                                                                         } ${shot.outputEnabled ? (theme === 'dark' ? 'bg-blue-900/20 border-blue-800' : 'bg-blue-50 border-blue-300') : ''}`}
                                                                     style={{ width: previewPanelWidth }}
                                                                 >
@@ -22308,12 +22452,20 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         const outputImages = shot.output_images || [];
                                                                         const selectedIndex = shot.selectedImageIndex ?? 0;
                                                                         const mode = node.settings?.mode || 'video';
+                                                                        const getPreviewBgClass = (index) => theme === 'solarized'
+                                                                            ? (index % 2 === 0 ? 'bg-[#fdf6e3]' : 'bg-[#eee8d5]')
+                                                                            : '';
 
                                                                         // 视频模式 - 显示单个视频缩略图
                                                                         if (mode === 'video') {
                                                                             return (
                                                                                 <div
-                                                                                    className={`flex-1 min-h-[80px] rounded overflow-hidden relative group/preview cursor-pointer border ${theme === 'dark' ? 'border-zinc-800 bg-black' : 'border-zinc-200 bg-zinc-50'}`}
+                                                                                    className={`flex-1 min-h-[80px] rounded overflow-hidden relative group/preview cursor-pointer border ${theme === 'dark'
+                                                                                        ? 'border-zinc-800 bg-black'
+                                                                                        : theme === 'solarized'
+                                                                                            ? `border-[#eee8d5] ${getPreviewBgClass(0)}`
+                                                                                            : 'border-zinc-200 bg-zinc-50'
+                                                                                        }`}
                                                                                     onClick={(e) => {
                                                                                         e.stopPropagation();
                                                                                         if (shot.video_url) setLightboxItem({ url: shot.video_url, type: 'video', prompt: shot.prompt });
@@ -22357,7 +22509,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                     <div className="flex flex-col gap-1 flex-1 min-h-[100px]">
                                                                                         {/* 主图 - 点击切换选中状态 */}
                                                                                         <div
-                                                                                            className={`relative flex-1 rounded border overflow-hidden transition-all group/main ${hasSelection ? 'border-blue-500 ring-1 ring-blue-500/50' : (theme === 'dark' ? 'border-zinc-700' : 'border-zinc-300')} ${isLocked ? 'cursor-not-allowed opacity-80' : 'cursor-pointer'}`}
+                                                                                            className={`relative flex-1 rounded border overflow-hidden transition-all group/main ${hasSelection ? 'border-blue-500 ring-1 ring-blue-500/50' : (theme === 'dark' ? 'border-zinc-700' : 'border-zinc-300')} ${theme === 'solarized' ? getPreviewBgClass(displayMainIndex) : ''} ${isLocked ? 'cursor-not-allowed opacity-80' : 'cursor-pointer'}`}
                                                                                             onClick={(e) => {
                                                                                                 e.stopPropagation();
                                                                                                 if (!isLocked) updateShot(node.id, shot.id, { selectedImageIndex: hasSelection ? -1 : displayMainIndex });
@@ -22424,7 +22576,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                             {thumbnails.map(({ img, idx }) => (
                                                                                                 <div
                                                                                                     key={idx}
-                                                                                                    className={`relative flex-1 rounded border overflow-hidden transition-all group/thumb ${theme === 'dark' ? 'border-zinc-700' : 'border-zinc-300'} ${isLocked ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:border-blue-400'}`}
+                                                                                                    className={`relative flex-1 rounded border overflow-hidden transition-all group/thumb ${theme === 'dark' ? 'border-zinc-700' : 'border-zinc-300'} ${theme === 'solarized' ? getPreviewBgClass(idx) : ''} ${isLocked ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:border-blue-400'}`}
                                                                                                     onClick={(e) => { e.stopPropagation(); if (!isLocked) updateShot(node.id, shot.id, { selectedImageIndex: idx }); }}
                                                                                                     onContextMenu={(e) => {
                                                                                                         // V3.7.29: 缩略图右键预览
@@ -22455,7 +22607,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                                 className={`relative rounded border overflow-hidden transition-all group/cell ${selectedIndex === idx
                                                                                                     ? 'border-blue-500 ring-1 ring-blue-500/50'
                                                                                                     : theme === 'dark' ? 'border-zinc-700' : 'border-zinc-300'
-                                                                                                    } ${isLocked ? 'cursor-not-allowed opacity-80' : 'cursor-pointer hover:border-blue-400'}`}
+                                                                                                    } ${theme === 'solarized' ? getPreviewBgClass(idx) : ''} ${isLocked ? 'cursor-not-allowed opacity-80' : 'cursor-pointer hover:border-blue-400'}`}
                                                                                                 onClick={(e) => {
                                                                                                     e.stopPropagation();
                                                                                                     if (!isLocked) updateShot(node.id, shot.id, { selectedImageIndex: selectedIndex === idx ? -1 : idx });
@@ -22523,7 +22675,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         const singleUrl = outputImages[0] || shot.output_url;
                                                                         return (
                                                                             <div
-                                                                                className={`flex-1 min-h-[80px] rounded overflow-hidden relative group/preview cursor-pointer border ${theme === 'dark' ? 'border-zinc-800 bg-black' : 'border-zinc-200 bg-zinc-50'}`}
+                                                                                className={`flex-1 min-h-[80px] rounded overflow-hidden relative group/preview cursor-pointer border ${theme === 'dark'
+                                                                                    ? 'border-zinc-800 bg-black'
+                                                                                    : theme === 'solarized'
+                                                                                        ? `border-[#eee8d5] ${getPreviewBgClass(0)}`
+                                                                                        : 'border-zinc-200 bg-zinc-50'
+                                                                                    }`}
                                                                                 onClick={(e) => {
                                                                                     e.stopPropagation();
                                                                                     if (singleUrl) setLightboxItem({ url: singleUrl, type: 'image', prompt: shot.prompt });
@@ -22636,7 +22793,11 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 </div>
                                 <div className="flex-1 flex flex-col p-2 gap-2 min-h-0">
                                     <div
-                                        className={`relative flex-1 rounded-lg overflow-hidden flex items-center justify-center min-h-0 ${theme === 'dark' ? 'bg-zinc-900' : 'bg-zinc-100'
+                                        className={`relative flex-1 rounded-lg overflow-hidden flex items-center justify-center min-h-0 ${theme === 'dark'
+                                            ? 'bg-zinc-900'
+                                            : theme === 'solarized'
+                                                ? 'bg-[#fdf6e3]'
+                                                : 'bg-zinc-100'
                                             }`}
                                         onDrop={(e) => handlePreviewDrop(node.id, e)}
                                         onDragOver={handleCanvasDragOver}
@@ -22659,7 +22820,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             isVideoUrl(node.content) || node.previewType === 'video' ? (
                                                 <video
                                                     src={node.content}
-                                                    className="w-full h-full object-contain bg-black"
+                                                    className={`w-full h-full object-contain ${theme === 'dark'
+                                                        ? 'bg-black'
+                                                        : theme === 'solarized'
+                                                            ? 'bg-[#fdf6e3]'
+                                                            : 'bg-zinc-100'
+                                                        }`}
                                                     controls
                                                     draggable={false}
                                                 />
@@ -22669,7 +22835,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     {node.previewMjImages.map((imgUrl, idx) => (
                                                         <div
                                                             key={idx}
-                                                            className="relative w-full h-full overflow-hidden bg-black flex items-center justify-center group"
+                                                            className={`relative w-full h-full overflow-hidden flex items-center justify-center group ${theme === 'dark'
+                                                                ? 'bg-black'
+                                                                : theme === 'solarized'
+                                                                    ? 'bg-[#fdf6e3]'
+                                                                    : 'bg-zinc-100'
+                                                                }`}
                                                         >
                                                             <img
                                                                 src={imgUrl}
@@ -22688,7 +22859,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 <div className="w-full h-full relative group/preview">
                                                     <LazyBase64Image
                                                         src={node.content || (node.previewMjImages && node.previewMjImages[0])}
-                                                        className="w-full h-full object-contain bg-black"
+                                                        className={`w-full h-full object-contain ${theme === 'dark'
+                                                            ? 'bg-black'
+                                                            : theme === 'solarized'
+                                                                ? 'bg-[#fdf6e3]'
+                                                                : 'bg-zinc-100'
+                                                            }`}
                                                         draggable={false}
                                                         onError={(e) => {
                                                             // 错误处理：由于 LazyBase64Image 有内部状态，这里主要处理外部 URL 错误
@@ -27146,6 +27322,8 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 previewBase.resolution = videoResolutionValues[0] || '720P';
                                             }
                                             const previewPayload = buildCustomParamPreviewPayload(previewBase, customParams);
+                                            const previewEndpoint = getModelLibraryPreviewEndpoint(entry);
+                                            const previewPython = buildPythonPreviewSnippet(previewEndpoint, previewPayload);
                                             return (
                                                 <div key={entry.id} className={`rounded-lg border p-3 space-y-3 ${theme === 'dark'
                                                     ? 'bg-[#18181b] border-zinc-800'
@@ -27361,13 +27539,13 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     <label className={`text-[9px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>自定义参数</label>
                                                                     <button
                                                                         onClick={() => addModelLibraryCustomParam(entry.id)}
-                                                                        disabled={!isEditing}
+                                                                        disabled={!isEditing || customParams.length >= MAX_CUSTOM_PARAMS}
                                                                         className={`text-[9px] px-1.5 py-0.5 rounded ${theme === 'dark'
                                                                             ? 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
                                                                             : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300'
-                                                                            } ${!isEditing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                                            } ${(!isEditing || customParams.length >= MAX_CUSTOM_PARAMS) ? 'opacity-50 cursor-not-allowed' : ''}`}
                                                                     >
-                                                                        + 添加参数
+                                                                        + 添加参数 ({customParams.length}/{MAX_CUSTOM_PARAMS})
                                                                     </button>
                                                                 </div>
                                                                 {customParams.length > 0 ? (
@@ -27377,6 +27555,11 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                 ? 'bg-zinc-900/60 border-zinc-800'
                                                                                 : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
                                                                                 }`}>
+                                                                                {(() => {
+                                                                                    const paramValues = Array.isArray(param.values) ? param.values : [];
+                                                                                    const paramNotes = param.valueNotes || {};
+                                                                                    return (
+                                                                                        <>
                                                                                 <div className="flex items-center gap-2">
                                                                                     <input
                                                                                         value={param.name || ''}
@@ -27408,12 +27591,51 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                 </div>
                                                                                 <TagListEditor
                                                                                     label="参数值"
-                                                                                    values={Array.isArray(param.values) ? param.values : []}
-                                                                                    onChange={(values) => updateModelLibraryCustomParam(entry.id, param.id, { values })}
+                                                                                    values={paramValues}
+                                                                                    onChange={(values) => {
+                                                                                        const nextNotes = { ...paramNotes };
+                                                                                        Object.keys(nextNotes).forEach((key) => {
+                                                                                            if (!values.includes(key)) delete nextNotes[key];
+                                                                                        });
+                                                                                        updateModelLibraryCustomParam(entry.id, param.id, { values, valueNotes: nextNotes });
+                                                                                    }}
                                                                                     placeholder="例：1024x1024,2K,low,high"
                                                                                     disabled={!isEditing}
                                                                                     theme={theme}
+                                                                                    formatItem={(value) => getCustomParamValueLabel(param, value)}
                                                                                 />
+                                                                                {paramValues.length > 0 && (
+                                                                                    <div className="space-y-1">
+                                                                                        <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>参数备注</div>
+                                                                                        {paramValues.map((value) => (
+                                                                                            <div key={value} className="flex items-center gap-2">
+                                                                                                <span className={`text-[9px] w-24 truncate ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`} title={value}>{value}</span>
+                                                                                                <input
+                                                                                                    value={paramNotes[value] || ''}
+                                                                                                    onChange={(e) => {
+                                                                                                        const nextNotes = { ...paramNotes };
+                                                                                                        const noteValue = e.target.value;
+                                                                                                        if (noteValue) {
+                                                                                                            nextNotes[value] = noteValue;
+                                                                                                        } else {
+                                                                                                            delete nextNotes[value];
+                                                                                                        }
+                                                                                                        updateModelLibraryCustomParam(entry.id, param.id, { valueNotes: nextNotes });
+                                                                                                    }}
+                                                                                                    placeholder="例：1:1 / 高清"
+                                                                                                    disabled={!isEditing}
+                                                                                                    className={`flex-1 text-[10px] rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                                                        ? 'bg-zinc-900 border-zinc-800 text-zinc-300 placeholder-zinc-600'
+                                                                                                        : 'bg-white border-zinc-300 text-zinc-900 placeholder-zinc-400'
+                                                                                                        }`}
+                                                                                                />
+                                                                                            </div>
+                                                                                        ))}
+                                                                                    </div>
+                                                                                )}
+                                                                                    </>
+                                                                                );
+                                                                            })()}
                                                                             </div>
                                                                         ))}
                                                                     </div>
@@ -27426,9 +27648,14 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     ? 'bg-zinc-950/60 border-zinc-800'
                                                                     : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
                                                                     }`}>
-                                                                    <div className={`text-[9px] mb-1 ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>请求预览（示例）</div>
+                                                                    <div className={`text-[9px] mb-1 ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>请求预览（JSON）</div>
+                                                                    <div className={`text-[9px] mb-1 ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>Endpoint: {previewEndpoint}</div>
                                                                     <pre className={`text-[9px] whitespace-pre-wrap ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>
                                                                         {JSON.stringify(previewPayload, null, 2)}
+                                                                    </pre>
+                                                                    <div className={`text-[9px] mt-2 mb-1 ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>Python 示例</div>
+                                                                    <pre className={`text-[9px] whitespace-pre-wrap ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>
+                                                                        {previewPython}
                                                                     </pre>
                                                                 </div>
                                                             )}
