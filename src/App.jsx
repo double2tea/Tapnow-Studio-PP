@@ -3847,6 +3847,92 @@ function TapnowApp() {
         return `${base}/proxy?url=${encodeURIComponent(rawUrl)}`;
     }, [localServerUrl]);
 
+    // 获取 Blob 对象（兼容 HTTP URL 和 Blob URL）
+    const getBlobFromUrl = async (url, options = {}) => {
+        if (!url) throw new Error('Invalid URL');
+        const useProxy = options.useProxy === true;
+        const fetchBlob = async (target) => {
+            const res = await fetch(target);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return await res.blob();
+        };
+        if (url.startsWith('data:')) {
+            return dataUrlToBlob(url);
+        }
+        if (url.startsWith('blob:')) {
+            try {
+                return await fetchBlob(url);
+            } catch (e) {
+                throw new Error('Blob 已失效');
+            }
+        }
+        const candidates = [url];
+        const proxied = resolveCacheFetchUrl(url, useProxy);
+        if (proxied && proxied !== url) candidates.push(proxied);
+        let lastError;
+        for (const candidate of candidates) {
+            try {
+                return await fetchBlob(candidate);
+            } catch (e) {
+                lastError = e;
+            }
+        }
+        throw lastError || new Error('图片加载失败');
+    };
+
+    // 获取 Base64 字符串（自动识别 Data URL 或 Blob URL 并转换）
+    const getBase64FromUrl = async (url, options = {}) => {
+        if (url.startsWith('data:')) {
+            const normalized = normalizeDataUrl(url);
+            const blob = dataUrlToBlob(normalized);
+            const dataUrl = await blobToDataURL(blob);
+            return dataUrl.split(',')[1] || '';
+        }
+        const blob = await getBlobFromUrl(url, options);
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const res = reader.result;
+                // 返回纯 Base64 部分
+                resolve(res.split(',')[1]);
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    };
+
+    const blobToDataURL = (blob) => {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    };
+
+    // 辅助函数：将 Base64 Data URL 转换为 Blob URL
+    const base64ToBlobUrl = async (base64Data) => {
+        try {
+            if (!base64Data || typeof base64Data !== 'string') {
+                return base64Data;
+            }
+            // 如果已经是 Blob URL 或 HTTP URL，直接返回
+            if (base64Data.startsWith('blob:') || base64Data.startsWith('http://') || base64Data.startsWith('https://')) {
+                return base64Data;
+            }
+            // 如果是 Base64 Data URL，转换为 Blob URL
+            if (base64Data.startsWith('data:')) {
+                const blob = dataUrlToBlob(base64Data);
+                return URL.createObjectURL(blob);
+            }
+            // 其他情况直接返回
+            return base64Data;
+        } catch (e) {
+            console.error('Base64转Blob失败', e);
+            return base64Data; // 失败则返回原数据
+        }
+    };
+
     const CACHE_FETCH_RETRY_MS = 5 * 60 * 1000;
     const getCacheFailureKey = useCallback((url) => {
         if (!url) return '';
@@ -7438,92 +7524,6 @@ function TapnowApp() {
             }));
         } finally {
             setIsChatSending(false);
-        }
-    };
-
-    // 获取 Blob 对象（兼容 HTTP URL 和 Blob URL）
-    const getBlobFromUrl = async (url, options = {}) => {
-        if (!url) throw new Error('Invalid URL');
-        const useProxy = options.useProxy === true;
-        const fetchBlob = async (target) => {
-            const res = await fetch(target);
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            return await res.blob();
-        };
-        if (url.startsWith('data:')) {
-            return dataUrlToBlob(url);
-        }
-        if (url.startsWith('blob:')) {
-            try {
-                return await fetchBlob(url);
-            } catch (e) {
-                throw new Error('Blob 已失效');
-            }
-        }
-        const candidates = [url];
-        const proxied = resolveCacheFetchUrl(url, useProxy);
-        if (proxied && proxied !== url) candidates.push(proxied);
-        let lastError;
-        for (const candidate of candidates) {
-            try {
-                return await fetchBlob(candidate);
-            } catch (e) {
-                lastError = e;
-            }
-        }
-        throw lastError || new Error('图片加载失败');
-    };
-
-    // 获取 Base64 字符串（自动识别 Data URL 或 Blob URL 并转换）
-    const getBase64FromUrl = async (url, options = {}) => {
-        if (url.startsWith('data:')) {
-            const normalized = normalizeDataUrl(url);
-            const blob = dataUrlToBlob(normalized);
-            const dataUrl = await blobToDataURL(blob);
-            return dataUrl.split(',')[1] || '';
-        }
-        const blob = await getBlobFromUrl(url, options);
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                const res = reader.result;
-                // 返回纯 Base64 部分
-                resolve(res.split(',')[1]);
-            };
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-        });
-    };
-
-    const blobToDataURL = (blob) => {
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(reader.result);
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-        });
-    };
-
-    // 辅助函数：将 Base64 Data URL 转换为 Blob URL
-    const base64ToBlobUrl = async (base64Data) => {
-        try {
-            if (!base64Data || typeof base64Data !== 'string') {
-                return base64Data;
-            }
-            // 如果已经是 Blob URL 或 HTTP URL，直接返回
-            if (base64Data.startsWith('blob:') || base64Data.startsWith('http://') || base64Data.startsWith('https://')) {
-                return base64Data;
-            }
-            // 如果是 Base64 Data URL，转换为 Blob URL
-            if (base64Data.startsWith('data:')) {
-                const blob = dataUrlToBlob(base64Data);
-                return URL.createObjectURL(blob);
-            }
-            // 其他情况直接返回
-            return base64Data;
-        } catch (e) {
-            console.error('Base64转Blob失败', e);
-            return base64Data; // 失败则返回原数据
         }
     };
 
