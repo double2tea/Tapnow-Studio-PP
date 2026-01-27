@@ -356,7 +356,7 @@ const normalizeBase64Payload = (value) => {
 const dataUrlToBlob = (dataUrl) => {
     const normalized = normalizeDataUrl(dataUrl);
     const match = normalized.match(/^data:([^;,]+)(;base64)?,(.*)$/i);
-    if (!match) throw new Error('Invalid data URL');
+    if (!match) return null;
     const mime = match[1] || 'application/octet-stream';
     const isBase64 = !!match[2];
     let data = match[3] || '';
@@ -372,7 +372,7 @@ const dataUrlToBlob = (dataUrl) => {
     try {
         binary = atob(data);
     } catch (e) {
-        throw new Error('Invalid base64 payload');
+        return null;
     }
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {
@@ -442,12 +442,16 @@ const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => 
             const convertToBlobUrl = async () => {
                 try {
                     const blob = dataUrlToBlob(normalized);
-                    if (!blob) throw new Error('Invalid data URL');
+                    if (!blob) {
+                        setError(true);
+                        setBlobUrl(null);
+                        return;
+                    }
                     const url = URL.createObjectURL(blob);
                     blobUrlRef.current = url;
                     setBlobUrl(url);
                 } catch (err) {
-                    console.error('Base64转Blob失败', err);
+                    console.warn('Base64转Blob失败', err);
                     setError(true);
                     setBlobUrl(null);
                 }
@@ -741,6 +745,7 @@ const HistoryItem = memo(({
     localServerUrl, // V2.6.1 Feature
     localCacheActive,
     onCacheMissing,
+    getHistoryMeta,
     isSelected, // V3.4.16: 选择状态
     onSelect, // V3.4.16: 选择回调
     providers,
@@ -819,6 +824,12 @@ const HistoryItem = memo(({
                 onCacheMissing && onCacheMissing(item.id, localCacheFallback);
             });
     }, [hasLocalCache, localCacheFallback, item.id, onCacheMissing]);
+
+    const historyMeta = getHistoryMeta ? getHistoryMeta(item) : null;
+    const ratioLabel = historyMeta?.ratioLabel ?? (item.ratio || item.mjRatio);
+    const resolutionLabel = historyMeta?.resolutionLabel ?? (item.resolution || (item.width && item.height ? `${item.width}x${item.height}` : null));
+    const durationLabel = historyMeta?.durationLabel ?? ((item.type === 'video' && item.duration) ? `${item.duration}s` : null);
+    const customParamLabels = historyMeta?.customParamLabels || [];
 
     return (
         <div
@@ -1039,12 +1050,13 @@ const HistoryItem = memo(({
                             const genType = isVideo
                                 ? (hasRefImage ? '图→视频' : '文→视频')
                                 : (hasRefImage ? '图→图' : '文→图');
-                            const resDisplay = item.resolution || (item.width && item.height ? `${item.width}x${item.height}` : null);
+                            const resDisplay = resolutionLabel;
                             return [
                                 genType,
-                                item.ratio || item.mjRatio,
+                                ratioLabel,
                                 resDisplay,
-                                isVideo && item.duration ? `${item.duration}s` : null
+                                isVideo && durationLabel ? durationLabel : null,
+                                ...customParamLabels
                             ].filter(Boolean).join(' · ');
                         })()}
                     </span>
@@ -1068,7 +1080,8 @@ const HistoryItem = memo(({
         prevProps.lightboxItem?.id === nextProps.lightboxItem?.id &&
         prevProps.isSelected === nextProps.isSelected &&
         prevProps.performanceMode === nextProps.performanceMode &&
-        prevProps.localCacheActive === nextProps.localCacheActive
+        prevProps.localCacheActive === nextProps.localCacheActive &&
+        prevProps.getHistoryMeta === nextProps.getHistoryMeta
     );
 });
 
@@ -1890,6 +1903,12 @@ const getValueLabelWithNotes = (value, notesEnabled, notes) => {
     if (!notesEnabled) return value;
     const note = notes?.[value];
     return note ? `${value}(${note})` : value;
+};
+const getNoteLabelWithNotes = (value, notesEnabled, notes) => {
+    if (!value) return '';
+    if (!notesEnabled) return value;
+    const note = notes?.[value];
+    return note || value;
 };
 const getCustomParamValueLabel = (param, value) => {
     return getValueLabelWithNotes(value, !!param?.notesEnabled, param?.valueNotes || {});
@@ -3150,9 +3169,17 @@ function TapnowApp() {
                         type: entry.type || 'Chat',
                         apiType: entry.apiType || 'openai',
                         ratioLimits: Array.isArray(entry.ratioLimits) ? entry.ratioLimits : null,
+                        ratioNotes: normalizeValueNotes(entry.ratioNotes),
+                        ratioNotesEnabled: !!entry.ratioNotesEnabled,
                         resolutionLimits: Array.isArray(entry.resolutionLimits) ? entry.resolutionLimits : null,
+                        resolutionNotes: normalizeResolutionNotes(entry.resolutionNotes),
+                        resolutionNotesEnabled: !!entry.resolutionNotesEnabled,
                         durations: Array.isArray(entry.durations) ? entry.durations : null,
+                        durationNotes: normalizeValueNotes(entry.durationNotes),
+                        durationNotesEnabled: !!entry.durationNotesEnabled,
                         videoResolutions: Array.isArray(entry.videoResolutions) ? entry.videoResolutions : null,
+                        videoResolutionNotes: normalizeValueNotes(entry.videoResolutionNotes),
+                        videoResolutionNotesEnabled: !!entry.videoResolutionNotesEnabled,
                         supportsFirstLastFrame: !!entry.supportsFirstLastFrame,
                         supportsHD: !!entry.supportsHD,
                         customParams: normalizeCustomParams(entry.customParams),
@@ -3456,6 +3483,7 @@ function TapnowApp() {
             return true;
         }
     });
+    const [cacheRefreshTick, setCacheRefreshTick] = useState(0);
     const [localCacheBannerVisible, setLocalCacheBannerVisible] = useState(false);
     const localCacheBannerTimerRef = useRef(null);
     const localCacheActive = localCacheEnabled && localCacheServerConnected;
@@ -3966,7 +3994,9 @@ function TapnowApp() {
             return await res.blob();
         };
         if (url.startsWith('data:')) {
-            return dataUrlToBlob(url);
+            const blob = dataUrlToBlob(url);
+            if (!blob) throw new Error('Invalid base64 payload');
+            return blob;
         }
         if (url.startsWith('blob:')) {
             try {
@@ -3985,6 +4015,7 @@ function TapnowApp() {
         if (url.startsWith('data:')) {
             const normalized = normalizeDataUrl(url);
             const blob = dataUrlToBlob(normalized);
+            if (!blob) throw new Error('Invalid base64 payload');
             const dataUrl = await blobToDataURL(blob);
             return dataUrl.split(',')[1] || '';
         }
@@ -4221,6 +4252,7 @@ function TapnowApp() {
             localCacheUrl: null,
             localFilePath: null
         })));
+        setCacheRefreshTick(prev => prev + 1);
         if (!options.silent) {
             showToast('已触发缓存刷新，将重新写入本地缓存路径', 'success');
         }
@@ -4720,7 +4752,7 @@ function TapnowApp() {
 
         const timer = setTimeout(cacheHistoryImages, 3000);
         return () => clearTimeout(timer);
-    }, [history, localCacheActive, localServerConfig.imageSavePath, localServerConfig.videoSavePath, saveImageToLocalCache, sanitizeCacheId, getCacheIdFromUrl, getItemProxyPreference]);
+    }, [history, localCacheActive, localServerConfig.imageSavePath, localServerConfig.videoSavePath, saveImageToLocalCache, sanitizeCacheId, getCacheIdFromUrl, getItemProxyPreference, cacheRefreshTick]);
 
     // V2.6.1 Feature: 历史记录本地缓存（视频）
     useEffect(() => {
@@ -4767,7 +4799,7 @@ function TapnowApp() {
 
         const timer = setTimeout(cacheHistoryVideos, 5000);
         return () => clearTimeout(timer);
-    }, [history, localCacheActive, localServerConfig.videoSavePath, saveVideoToLocalCache, getItemProxyPreference]);
+    }, [history, localCacheActive, localServerConfig.videoSavePath, saveVideoToLocalCache, getItemProxyPreference, cacheRefreshTick]);
 
     const canvasRef = useRef(null);
     const lastMousePos = useRef({ x: 0, y: 0 });
@@ -5281,6 +5313,42 @@ function TapnowApp() {
         if (!modelId) return '选择模型';
         const config = getApiConfigByKey(modelId);
         return config?.displayName || config?.modelName || config?.id || modelId;
+    }, [getApiConfigByKey]);
+
+    const getHistoryMeta = useCallback((item) => {
+        if (!item) return null;
+        const modelKey = item?.apiConfig?.modelId || item?.apiConfig?.id || item?.modelName || item?.modelId;
+        const config = modelKey ? getApiConfigByKey(modelKey) : null;
+        const ratioValue = item.ratio || item.mjRatio || '';
+        const ratioLabel = ratioValue
+            ? getNoteLabelWithNotes(ratioValue, !!config?.ratioNotesEnabled, config?.ratioNotes || {})
+            : '';
+        const isVideo = item.type === 'video';
+        const rawResolution = item.resolution || (item.width && item.height ? `${item.width}x${item.height}` : '');
+        let resolutionLabel = rawResolution;
+        if (rawResolution) {
+            const notesEnabled = isVideo ? !!config?.videoResolutionNotesEnabled : !!config?.resolutionNotesEnabled;
+            const notes = isVideo ? (config?.videoResolutionNotes || {}) : (config?.resolutionNotes || {});
+            const normalized = isVideo ? normalizeVideoResolution(rawResolution) : normalizeResolutionOption(rawResolution);
+            const lookupKey = normalized || rawResolution;
+            resolutionLabel = getNoteLabelWithNotes(lookupKey, notesEnabled, notes);
+        }
+        let durationLabel = '';
+        if (isVideo && item.duration) {
+            const durationValue = String(item.duration).endsWith('s') ? String(item.duration) : `${item.duration}s`;
+            durationLabel = getNoteLabelWithNotes(durationValue, !!config?.durationNotesEnabled, config?.durationNotes || {});
+        }
+        const customParamLabels = [];
+        if (item.customParams && Array.isArray(config?.customParams)) {
+            config.customParams.forEach((param) => {
+                const selected = getCustomParamSelection(param, item.customParams);
+                if (selected === '' || selected === undefined || selected === null) return;
+                const label = getNoteLabelWithNotes(selected, !!param?.notesEnabled, param?.valueNotes || {});
+                const name = param?.name || param?.id || '参数';
+                customParamLabels.push(`${name}:${label}`);
+            });
+        }
+        return { ratioLabel, resolutionLabel, durationLabel, customParamLabels };
     }, [getApiConfigByKey]);
 
     const renderCustomParamInputs = useCallback((modelId, currentValues, onChange) => {
@@ -10535,7 +10603,8 @@ function TapnowApp() {
                 ratio: ratio, // 保存比例信息，用于后续验证返回结果
                 resolution: resolution, // V3.7.26: 保存分辨率
                 duration: type === 'video' ? duration : null,
-                hasInputImages: connectedImages.length > 0 // V3.7.26: 是否有参考图（用于判断文→图还是图→图）
+                hasInputImages: connectedImages.length > 0, // V3.7.26: 是否有参考图（用于判断文→图还是图→图）
+                customParams: customParamSelections || null
             }, ...prev]);
         }
 
@@ -12050,8 +12119,12 @@ function TapnowApp() {
     const getDataUrlFromUrl = async (url, options = {}) => {
         if (!url) return url;
         if (url.startsWith('data:')) return url;
-        const useProxy = getProxyPreferenceForUrl(url, options.useProxy === true);
-        const blob = await getBlobFromUrl(url, { useProxy });
+        const cachedUrl = localCacheActive && cachedHistoryUrlRef.current.has(url)
+            ? cachedHistoryUrlRef.current.get(url)
+            : null;
+        const resolvedUrl = cachedUrl || url;
+        const useProxy = getProxyPreferenceForUrl(resolvedUrl, options.useProxy === true);
+        const blob = await getBlobFromUrl(resolvedUrl, { useProxy });
         return await blobToDataURL(blob);
     };
 
@@ -25212,6 +25285,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             localCacheActive={localCacheActive}
                                                             onCacheMissing={handleHistoryCacheMissing}
                                                             onDelete={deleteHistoryItem}
+                                                            getHistoryMeta={getHistoryMeta}
                                                             isSelected={historySelection.has(item.id)}
                                                             onSelect={(id) => {
                                                                 setHistorySelection(prev => {
@@ -25294,6 +25368,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             localCacheActive={localCacheActive}
                                                             onCacheMissing={handleHistoryCacheMissing}
                                                             onDelete={deleteHistoryItem}
+                                                            getHistoryMeta={getHistoryMeta}
                                                             isSelected={historySelection.has(item.id)}
                                                             onSelect={(id) => {
                                                                 setHistorySelection(prev => {
@@ -26519,36 +26594,6 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             a.download = filename;
                                             a.click();
                                             window.URL.revokeObjectURL(blobUrl);
-
-                                            if (localCacheActive && resolvedUrl && !resolvedUrl.startsWith('data:') && !resolvedUrl.startsWith('blob:')) {
-                                                try {
-                                                    if (isVideo) {
-                                                        const result = await saveVideoToLocalCache(item.id, resolvedUrl, 'history', { useProxy });
-                                                        if (result?.url) {
-                                                            setHistory(prev => prev.map(h => h.id === item.id ? { ...h, localCacheUrl: result.url, localFilePath: result.path } : h));
-                                                        }
-                                                    } else {
-                                                        const cacheId = getCacheIdFromUrl(resolvedUrl, item.id);
-                                                        const result = await saveImageToLocalCache(cacheId, resolvedUrl, 'history', { forceId: true, useProxy });
-                                                        if (result?.url) {
-                                                            cachedHistoryUrlRef.current.set(resolvedUrl, result.url);
-                                                            setHistory(prev => prev.map(h => {
-                                                                if (h.id !== item.id) return h;
-                                                                const nextMap = h.localCacheMap ? { ...h.localCacheMap } : {};
-                                                                nextMap[resolvedUrl] = result.url;
-                                                                return {
-                                                                    ...h,
-                                                                    localCacheUrl: h.localCacheUrl || result.url,
-                                                                    localFilePath: h.localFilePath || result.path,
-                                                                    localCacheMap: nextMap
-                                                                };
-                                                            }));
-                                                        }
-                                                    }
-                                                } catch (cacheErr) {
-                                                    console.warn('[下载] 写入本地缓存失败:', cacheErr);
-                                                }
-                                            }
                                         } catch (err) {
                                             console.error('下载失败:', err);
                                             alert('下载失败，请重试');
@@ -27172,9 +27217,17 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                             type: entry.type || 'Chat',
                                                                             apiType: entry.apiType || 'openai',
                                                                             ratioLimits: Array.isArray(entry.ratioLimits) ? entry.ratioLimits : null,
+                                                                            ratioNotes: normalizeValueNotes(entry.ratioNotes),
+                                                                            ratioNotesEnabled: !!entry.ratioNotesEnabled,
                                                                             resolutionLimits: Array.isArray(entry.resolutionLimits) ? entry.resolutionLimits : null,
+                                                                            resolutionNotes: normalizeResolutionNotes(entry.resolutionNotes),
+                                                                            resolutionNotesEnabled: !!entry.resolutionNotesEnabled,
                                                                             durations: Array.isArray(entry.durations) ? entry.durations : null,
+                                                                            durationNotes: normalizeValueNotes(entry.durationNotes),
+                                                                            durationNotesEnabled: !!entry.durationNotesEnabled,
                                                                             videoResolutions: Array.isArray(entry.videoResolutions) ? entry.videoResolutions : null,
+                                                                            videoResolutionNotes: normalizeValueNotes(entry.videoResolutionNotes),
+                                                                            videoResolutionNotesEnabled: !!entry.videoResolutionNotesEnabled,
                                                                             supportsFirstLastFrame: !!entry.supportsFirstLastFrame,
                                                                             supportsHD: !!entry.supportsHD,
                                                                             customParams: normalizeCustomParams(entry.customParams),
@@ -27867,7 +27920,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         {ratioValues.length > 0 && (
                                                                             <div className="mt-1 space-y-1">
                                                                                 <div className="flex items-center gap-2">
-                                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>比例映射提示名</div>
+                                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>映射提示名</div>
                                                                                     <label className={`flex items-center gap-1 text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
                                                                                         <input
                                                                                             type="checkbox"
@@ -27875,9 +27928,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                             onChange={(e) => updateModelLibraryEntry(entry.id, { ratioNotesEnabled: e.target.checked })}
                                                                                             disabled={!isEditing}
                                                                                         />
-                                                                                        <span>启用提示</span>
+                                                                                        <span>启用</span>
                                                                                     </label>
-                                                                                    <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>提示用于辅助选择</span>
+                                                                                    <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>仅用于辅助选择</span>
                                                                                     <button
                                                                                         onClick={() => toggleLibraryNotesCollapsed(entry.id, 'ratio')}
                                                                                         className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
@@ -27933,7 +27986,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         {resolutionValues.length > 0 && (
                                                                             <div className="mt-1 space-y-1">
                                                                                 <div className="flex items-center gap-2">
-                                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>分辨率映射提示名</div>
+                                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>映射提示名</div>
                                                                                     <label className={`flex items-center gap-1 text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
                                                                                         <input
                                                                                             type="checkbox"
@@ -27941,9 +27994,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                             onChange={(e) => updateModelLibraryEntry(entry.id, { resolutionNotesEnabled: e.target.checked })}
                                                                                             disabled={!isEditing}
                                                                                         />
-                                                                                        <span>启用提示</span>
+                                                                                        <span>启用</span>
                                                                                     </label>
-                                                                                    <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>提示用于辅助选择</span>
+                                                                                    <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>仅用于辅助选择</span>
                                                                                     <button
                                                                                         onClick={() => toggleLibraryNotesCollapsed(entry.id, 'resolution')}
                                                                                         className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
@@ -28007,7 +28060,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         {ratioValues.length > 0 && (
                                                                             <div className="mt-1 space-y-1">
                                                                                 <div className="flex items-center gap-2">
-                                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>比例映射提示名</div>
+                                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>映射提示名</div>
                                                                                     <label className={`flex items-center gap-1 text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
                                                                                         <input
                                                                                             type="checkbox"
@@ -28015,9 +28068,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                             onChange={(e) => updateModelLibraryEntry(entry.id, { ratioNotesEnabled: e.target.checked })}
                                                                                             disabled={!isEditing}
                                                                                         />
-                                                                                        <span>启用提示</span>
+                                                                                        <span>启用</span>
                                                                                     </label>
-                                                                                    <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>提示用于辅助选择</span>
+                                                                                    <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>仅用于辅助选择</span>
                                                                                     <button
                                                                                         onClick={() => toggleLibraryNotesCollapsed(entry.id, 'ratio')}
                                                                                         className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
@@ -28076,7 +28129,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         {durationValues.length > 0 && (
                                                                             <div className="mt-1 space-y-1">
                                                                                 <div className="flex items-center gap-2">
-                                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>时长映射提示名</div>
+                                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>映射提示名</div>
                                                                                     <label className={`flex items-center gap-1 text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
                                                                                         <input
                                                                                             type="checkbox"
@@ -28084,9 +28137,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                             onChange={(e) => updateModelLibraryEntry(entry.id, { durationNotesEnabled: e.target.checked })}
                                                                                             disabled={!isEditing}
                                                                                         />
-                                                                                        <span>启用提示</span>
+                                                                                        <span>启用</span>
                                                                                     </label>
-                                                                                    <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>提示用于辅助选择</span>
+                                                                                    <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>仅用于辅助选择</span>
                                                                                     <button
                                                                                         onClick={() => toggleLibraryNotesCollapsed(entry.id, 'duration')}
                                                                                         className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
@@ -28142,7 +28195,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         {videoResolutionValues.length > 0 && (
                                                                             <div className="mt-1 space-y-1">
                                                                                 <div className="flex items-center gap-2">
-                                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>分辨率映射提示名</div>
+                                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>映射提示名</div>
                                                                                     <label className={`flex items-center gap-1 text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
                                                                                         <input
                                                                                             type="checkbox"
@@ -28150,9 +28203,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                             onChange={(e) => updateModelLibraryEntry(entry.id, { videoResolutionNotesEnabled: e.target.checked })}
                                                                                             disabled={!isEditing}
                                                                                         />
-                                                                                        <span>启用提示</span>
+                                                                                        <span>启用</span>
                                                                                     </label>
-                                                                                    <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>提示用于辅助选择</span>
+                                                                                    <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>仅用于辅助选择</span>
                                                                                     <button
                                                                                         onClick={() => toggleLibraryNotesCollapsed(entry.id, 'video-resolution')}
                                                                                         className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
@@ -28287,7 +28340,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                 {paramValues.length > 0 && (
                                                                                     <div className="space-y-1">
                                                                                         <div className="flex items-center gap-2">
-                                                                                            <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>参数映射提示名</div>
+                                                                                            <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>映射提示名</div>
                                                                                             <label className={`flex items-center gap-1 text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
                                                                                                 <input
                                                                                                     type="checkbox"
@@ -28295,9 +28348,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                                     onChange={(e) => updateModelLibraryCustomParam(entry.id, param.id, { notesEnabled: e.target.checked })}
                                                                                                     disabled={!isEditing}
                                                                                                 />
-                                                                                                <span>启用提示</span>
+                                                                                                <span>启用</span>
                                                                                             </label>
-                                                                                            <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>提示用于辅助选择</span>
+                                                                                            <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>仅用于辅助选择</span>
                                                                                             <button
                                                                                                 onClick={() => toggleLibraryNotesCollapsed(entry.id, `param-${param.id}`)}
                                                                                                 className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
