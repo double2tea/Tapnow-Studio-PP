@@ -4358,7 +4358,12 @@ function TapnowApp() {
         if (historyLocalCacheMap.has(raw)) return false;
         if (historyUrlProxyMap.has(raw)) return !!historyUrlProxyMap.get(raw);
         const inferred = inferProviderFromUrl(raw);
-        if (inferred && providers[inferred]?.useProxy) return true;
+        if (inferred) {
+            if (providers[inferred]?.useProxy) return true;
+            const inferredLower = inferred.toLowerCase();
+            const matchedKey = Object.keys(providers).find(key => key.toLowerCase() === inferredLower);
+            if (matchedKey && providers[matchedKey]?.useProxy) return true;
+        }
         return !!fallback;
     }, [historyUrlProxyMap, historyLocalCacheMap, localServerUrl, inferProviderFromUrl, providers]);
 
