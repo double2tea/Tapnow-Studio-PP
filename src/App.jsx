@@ -65,6 +65,8 @@ import {
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 
+const DEFAULT_VIEW = { x: 0, y: 0, zoom: 1 };
+
 
 // --- MaskVisualFeedback 组件：蒙版视觉反馈层 ---
 const MaskVisualFeedback = ({ canvasRef, isDrawing }) => {
@@ -423,8 +425,14 @@ const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => 
                         blobUrlRef.current = url;
                         setBlobUrl(url);
                     } else {
-                        console.warn(`[LazyBase64Image] Image not found in IDB: ${src}`);
-                        setError(true);
+                        const fallback = getAssetBundleFallbackById(src);
+                        if (fallback) {
+                            blobUrlRef.current = fallback;
+                            setBlobUrl(fallback);
+                        } else {
+                            console.warn(`[LazyBase64Image] Image not found in IDB: ${src}`);
+                            setError(true);
+                        }
                     }
                 } catch (err) {
                     console.error('[LazyBase64Image] IDB resolve failed:', err);
@@ -436,9 +444,16 @@ const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => 
             return;
         }
 
-        // 如果是 Base64 Data URL，转换为 Blob URL
+        // 如果是 Base64 Data URL，优先直用（file:// 下避免 blob: 安全限制）
         if (src.startsWith('data:')) {
             const normalized = normalizeDataUrl(src);
+            const isFileProtocol = typeof window !== 'undefined' && window.location?.protocol === 'file:';
+            if (isFileProtocol) {
+                blobUrlRef.current = normalized;
+                setBlobUrl(normalized);
+                setLoading(false);
+                return;
+            }
             const convertToBlobUrl = async () => {
                 try {
                     const blob = dataUrlToBlob(normalized);
@@ -491,6 +506,44 @@ const LazyBase64Image = ({ src, className, alt, onError, onLoad, ...props }) => 
             alt={alt}
             onError={onError}
             onLoad={onLoad}
+            {...props}
+        />
+    );
+};
+
+const ResolvedVideo = ({ src, className, onError, onLoadedMetadata, ...props }) => {
+    const [resolvedSrc, setResolvedSrc] = useState('');
+    useEffect(() => {
+        let active = true;
+        if (!src) {
+            setResolvedSrc('');
+            return () => { active = false; };
+        }
+        if (LocalImageManager.isImageId(src)) {
+            (async () => {
+                const dataUrl = await LocalImageManager.getImage(src);
+                if (!active) return;
+                if (dataUrl) {
+                    setResolvedSrc(dataUrl);
+                } else {
+                    const fallback = getAssetBundleFallbackById(src);
+                    setResolvedSrc(fallback || '');
+                }
+            })();
+            return () => { active = false; };
+        }
+        setResolvedSrc(src);
+        return () => { active = false; };
+    }, [src]);
+
+    if (!resolvedSrc) return null;
+
+    return (
+        <video
+            src={resolvedSrc}
+            className={className}
+            onError={onError}
+            onLoadedMetadata={onLoadedMetadata}
             {...props}
         />
     );
@@ -751,18 +804,22 @@ const HistoryItem = memo(({
     providers,
     defaultProviders,
     historyLocalCacheMap,
-    resolveHistoryUrl
+    resolveHistoryUrl,
+    isLocalCacheUrlAvailable
 }) => {
-    const primaryUrl = item.url || item.originalUrl || item.mjOriginalUrl || (item.mjImages && item.mjImages.length > 0 ? item.mjImages[0] : null);
+    const multiImages = Array.isArray(item.mjImages) && item.mjImages.length > 1
+        ? item.mjImages
+        : (Array.isArray(item.output_images) && item.output_images.length > 1 ? item.output_images : null);
+    const primaryUrl = item.url || item.originalUrl || item.mjOriginalUrl || (multiImages && multiImages.length > 0 ? multiImages[0] : null);
     const mappedCacheUrl = localCacheActive && primaryUrl
         ? (historyLocalCacheMap && historyLocalCacheMap.has(primaryUrl)
             ? historyLocalCacheMap.get(primaryUrl)
             : (item.localCacheMap ? item.localCacheMap[primaryUrl] : null))
         : null;
     const localCacheFallback = mappedCacheUrl || item.localCacheUrl || (item.localCacheMap ? Object.values(item.localCacheMap)[0] : null);
-    const hasLocalCache = !!(localCacheActive && localCacheFallback);
+    const hasLocalCache = !!(localCacheActive && localCacheFallback && (!isLocalCacheUrlAvailable || isLocalCacheUrlAvailable(localCacheFallback)));
     const thumbnailUrl = item.thumbnailUrl || null;
-    const canDrag = item.status === 'completed' && (item.type === 'image' || (item.mjImages && item.mjImages.length > 0));
+    const canDrag = item.status === 'completed' && (item.type === 'image' || (multiImages && multiImages.length > 0));
     const rawModelName = (() => {
         const fallback = item.apiConfig?.modelId || item.apiConfig?.model || item.model || item.modelName || '未知模型';
         if (item.modelName && item.provider && item.modelName.toLowerCase() === item.provider.toLowerCase()) return fallback;
@@ -774,6 +831,11 @@ const HistoryItem = memo(({
         if (hasLocalCache) return localCacheFallback;
         if (performanceMode !== 'off' && thumbnailUrl) return thumbnailUrl;
         return originalUrl;
+    };
+    const getResolvedDisplayUrl = (originalUrl) => {
+        const raw = getDisplayUrl(originalUrl);
+        if (resolveHistoryUrl) return resolveHistoryUrl(item, raw);
+        return raw;
     };
     const [videoSrc, setVideoSrc] = useState(null);
     const resolveItemUrl = (specificUrl = null) => {
@@ -788,9 +850,9 @@ const HistoryItem = memo(({
     };
     const getDragUrl = (specificUrl = null) => {
         if (specificUrl) return resolveItemUrl(specificUrl);
-        if (item.mjImages && item.mjImages.length > 0) {
+        if (multiImages && multiImages.length > 0) {
             const index = item.selectedMjImageIndex ?? 0;
-            const selected = item.mjImages[index] || item.mjImages[0];
+            const selected = multiImages[index] || multiImages[0];
             if (selected) return resolveItemUrl(selected);
         }
         return resolveItemUrl();
@@ -815,23 +877,16 @@ const HistoryItem = memo(({
     useEffect(() => {
         const fallback = item.url || item.originalUrl || item.mjOriginalUrl;
         const nextSrc = hasLocalCache ? localCacheFallback : fallback;
-        setVideoSrc(nextSrc);
-    }, [item.url, item.originalUrl, item.mjOriginalUrl, hasLocalCache, localCacheFallback]);
+        const resolved = resolveHistoryUrl ? resolveHistoryUrl(item, nextSrc) : nextSrc;
+        setVideoSrc(resolved);
+    }, [item.url, item.originalUrl, item.mjOriginalUrl, hasLocalCache, localCacheFallback, resolveHistoryUrl]);
 
-    const cacheCheckRef = useRef({ url: null, time: 0 });
     useEffect(() => {
-        if (!hasLocalCache || !localCacheFallback) return;
-        const now = Date.now();
-        if (cacheCheckRef.current.url === localCacheFallback && now - cacheCheckRef.current.time < 10000) return;
-        cacheCheckRef.current = { url: localCacheFallback, time: now };
-        fetch(localCacheFallback, { method: 'HEAD' })
-            .then(res => {
-                if (!res.ok) onCacheMissing && onCacheMissing(item.id, localCacheFallback);
-            })
-            .catch(() => {
-                onCacheMissing && onCacheMissing(item.id, localCacheFallback);
-            });
-    }, [hasLocalCache, localCacheFallback, item.id, onCacheMissing]);
+        if (!localCacheActive || !localCacheFallback || !onCacheMissing) return;
+        if (isLocalCacheUrlAvailable && !isLocalCacheUrlAvailable(localCacheFallback)) {
+            onCacheMissing(item.id, localCacheFallback);
+        }
+    }, [localCacheActive, localCacheFallback, item.id, onCacheMissing, isLocalCacheUrlAvailable]);
 
     const historyMeta = getHistoryMeta ? getHistoryMeta(item) : null;
     const ratioLabel = historyMeta?.ratioLabel ?? (item.ratio || item.mjRatio);
@@ -886,7 +941,7 @@ const HistoryItem = memo(({
                     {isSelected && <CheckCircle2 size={16} className="text-white" />}
                 </button>
             )}
-            <div className={`${theme === 'dark' ? 'bg-black' : theme === 'solarized' ? 'bg-[#fafafa]' : 'bg-[#fafafa]'} relative ${((item.mjImages && (item.mjImages.length === 4 || item.mjImages.length > 1)) || (item.mjNeedsSplit && item.apiConfig?.modelId?.includes('mj')))
+            <div className={`${theme === 'dark' ? 'bg-black' : theme === 'solarized' ? 'bg-[#fafafa]' : 'bg-[#fafafa]'} relative ${((multiImages && multiImages.length > 1) || (item.mjNeedsSplit && item.apiConfig?.modelId?.includes('mj')))
                 ? (() => {
                     const ratio = item.mjRatio || '1:1';
                     if (ratio === '16:9') return 'aspect-video';
@@ -899,15 +954,18 @@ const HistoryItem = memo(({
                 : 'aspect-video'
                 }`}>
                 {item.status === 'completed' ? (
-                    item.mjImages && (item.mjImages.length === 4 || item.mjImages.length > 1) ? (
-                        <div className={`w-full h-full grid gap-0.5 p-0.5 ${item.mjImages.length === 4 ? 'grid-cols-2 grid-rows-2' : 'grid-cols-2'}`}>
-                            {item.mjImages.map((imgUrl, idx) => {
+                    multiImages && multiImages.length > 1 ? (
+                        <div className={`w-full h-full grid gap-0.5 p-0.5 ${multiImages.length === 4 ? 'grid-cols-2 grid-rows-2' : 'grid-cols-2'}`}>
+                            {multiImages.map((imgUrl, idx) => {
                                 const imgInfo = item.mjImageInfo && item.mjImageInfo[idx];
                                 const cachedImgUrl = localCacheActive && item.localCacheMap ? item.localCacheMap[imgUrl] : null;
-                                const displayImgUrl = cachedImgUrl
+                                const rawDisplayImgUrl = cachedImgUrl
                                     || (performanceMode !== 'off' && item.mjThumbnails && item.mjThumbnails[idx]
                                         ? item.mjThumbnails[idx]
                                         : imgUrl);
+                                const displayImgUrl = resolveHistoryUrl
+                                    ? resolveHistoryUrl(item, rawDisplayImgUrl)
+                                    : rawDisplayImgUrl;
                                 return (
                                     <HistoryMjImageCell
                                         key={idx}
@@ -929,13 +987,15 @@ const HistoryItem = memo(({
                     ) : (
                         item.type === 'image' ? (
                             <LazyBase64Image
-                                src={getDisplayUrl(item.url || item.originalUrl || item.mjOriginalUrl)}
+                                src={getResolvedDisplayUrl(item.url || item.originalUrl || item.mjOriginalUrl)}
                                 loading="lazy"
                                 className="w-full h-full object-cover"
                                 alt={item.prompt || '生成的图片'}
                                 onError={(e) => {
-                                    console.error('图片加载失败:', item.url || item.originalUrl || item.mjOriginalUrl);
-                                    onCacheMissing && onCacheMissing(item.id, getDisplayUrl(item.url || item.originalUrl || item.mjOriginalUrl));
+                                    const rawUrl = item.url || item.originalUrl || item.mjOriginalUrl;
+                                    const resolvedUrl = getResolvedDisplayUrl(rawUrl);
+                                    console.error('图片加载失败:', resolvedUrl || rawUrl);
+                                    onCacheMissing && onCacheMissing(item.id, resolvedUrl || rawUrl);
                                     e.target.style.display = 'none';
                                 }}
                             />
@@ -944,7 +1004,7 @@ const HistoryItem = memo(({
                             (() => {
                                 // 简单处理：直接显示视频，后续可优化
                                 return (
-                                    <video
+                                    <ResolvedVideo
                                         src={videoSrc || item.url || item.originalUrl}
                                         className="w-full h-full object-cover"
                                         muted
@@ -1091,7 +1151,8 @@ const HistoryItem = memo(({
         prevProps.localCacheActive === nextProps.localCacheActive &&
         prevProps.getHistoryMeta === nextProps.getHistoryMeta &&
         prevProps.historyLocalCacheMap === nextProps.historyLocalCacheMap &&
-        prevProps.resolveHistoryUrl === nextProps.resolveHistoryUrl
+        prevProps.resolveHistoryUrl === nextProps.resolveHistoryUrl &&
+        prevProps.isLocalCacheUrlAvailable === nextProps.isLocalCacheUrlAvailable
     );
 });
 
@@ -1829,18 +1890,28 @@ const stripValueNotes = (value) => {
         .replace(/\s+/g, '')
         .trim();
 };
-const normalizeJimengVideoRatio = (value) => {
+const normalizeJimengVideoRatio = (value, options = {}) => {
+    const defaultRatio = options.defaultRatio ? String(options.defaultRatio) : '1:1';
+    const allowed = Array.isArray(options.allowedRatios)
+        ? new Set(options.allowedRatios.map((item) => String(item).toLowerCase()))
+        : null;
     const raw = stripValueNotes(value);
-    if (!raw) return '1:1';
-    if (raw.toLowerCase() === 'auto') return '1:1';
+    if (!raw) return defaultRatio;
+    const lower = raw.toLowerCase();
+    if (lower === 'auto') {
+        return allowed ? (allowed.has('auto') ? 'auto' : defaultRatio) : defaultRatio;
+    }
     const match = raw.match(/^(\d+):(\d+)$/);
     if (match) {
         const w = parseInt(match[1], 10);
         const h = parseInt(match[2], 10);
         if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
-            return `${w}:${h}`;
+            const normalized = `${w}:${h}`;
+            if (allowed && !allowed.has(normalized.toLowerCase())) return defaultRatio;
+            return normalized;
         }
     }
+    if (allowed && !allowed.has(raw.toLowerCase())) return defaultRatio;
     return raw;
 };
 const supportsJimengVideoResolution = (modelKey) => {
@@ -1970,6 +2041,10 @@ function getDefaultRequestTemplateForType(type) {
         method: 'POST',
         bodyType: 'json',
         headers: { 'Content-Type': 'application/json' },
+        query: {},
+        files: {},
+        timeoutMs: null,
+        responseParser: '',
         body
     };
 }
@@ -2095,6 +2170,14 @@ const normalizeRequestTemplate = (template) => {
         headers: (template.headers && typeof template.headers === 'object' && !Array.isArray(template.headers))
             ? { ...template.headers }
             : {},
+        query: (template.query && typeof template.query === 'object' && !Array.isArray(template.query))
+            ? { ...template.query }
+            : {},
+        files: (template.files && typeof template.files === 'object' && !Array.isArray(template.files))
+            ? { ...template.files }
+            : {},
+        timeoutMs: Number.isFinite(template.timeoutMs) ? Number(template.timeoutMs) : null,
+        responseParser: typeof template.responseParser === 'string' ? template.responseParser.trim() : '',
         body: (template.body && typeof template.body === 'object' && !Array.isArray(template.body))
             ? template.body
             : (template.body ?? {})
@@ -2172,13 +2255,44 @@ const resolveTemplateValue = (value, vars, options = {}) => {
     }
     return value;
 };
+const appendQueryParams = (endpoint, query) => {
+    if (!endpoint || !query || typeof query !== 'object') return endpoint;
+    const entries = Object.entries(query).filter(([key, val]) => key);
+    if (entries.length === 0) return endpoint;
+    const isAbsolute = /^https?:/i.test(endpoint);
+    const base = isAbsolute ? undefined : 'http://placeholder';
+    let urlObj;
+    try {
+        urlObj = new URL(endpoint, base);
+    } catch (e) {
+        return endpoint;
+    }
+    entries.forEach(([key, val]) => {
+        if (val === undefined || val === null || val === '') return;
+        if (Array.isArray(val)) {
+            val.forEach((item) => {
+                if (item === undefined || item === null || item === '') return;
+                urlObj.searchParams.append(key, String(item));
+            });
+            return;
+        }
+        urlObj.searchParams.set(key, String(val));
+    });
+    if (isAbsolute) return urlObj.toString();
+    const path = urlObj.pathname || '';
+    const search = urlObj.search || '';
+    const hash = urlObj.hash || '';
+    return `${path}${search}${hash}`;
+};
 const buildRequestFromTemplate = (template, vars, options = {}) => {
     if (!template) return null;
     const bodyType = (template.bodyType || 'json').toString().toLowerCase();
     const resolvedEndpoint = resolveTemplateString(template.endpoint || '', vars, { bodyType });
     const method = (template.method || 'POST').toString().toUpperCase();
     const headers = resolveTemplateValue(template.headers || {}, vars, { bodyType });
+    const resolvedQuery = resolveTemplateValue(template.query || {}, vars, { bodyType });
     const resolvedBody = resolveTemplateValue(template.body || {}, vars, { bodyType });
+    const resolvedFiles = resolveTemplateValue(template.files || {}, vars, { bodyType });
     let body = resolvedBody;
     if (bodyType === 'multipart') {
         const form = new FormData();
@@ -2205,6 +2319,27 @@ const buildRequestFromTemplate = (template, vars, options = {}) => {
                 form.append(key, String(val));
             }
         });
+        Object.entries(resolvedFiles || {}).forEach(([key, val]) => {
+            if (!key || val === undefined || val === null) return;
+            const appendFile = (fileVal) => {
+                if (!fileVal) return;
+                if (fileVal instanceof Blob || fileVal instanceof File) {
+                    form.append(key, fileVal, fileVal.name || 'file');
+                    return;
+                }
+                if (typeof fileVal === 'string' && fileVal.startsWith('data:')) {
+                    try {
+                        const blob = dataUrlToBlob(fileVal);
+                        form.append(key, blob, 'file');
+                    } catch { }
+                }
+            };
+            if (Array.isArray(val)) {
+                val.forEach(appendFile);
+                return;
+            }
+            appendFile(val);
+        });
         body = form;
     } else if (bodyType === 'raw') {
         if (typeof body !== 'string') {
@@ -2212,11 +2347,13 @@ const buildRequestFromTemplate = (template, vars, options = {}) => {
         }
     }
     return {
-        url: resolvedEndpoint,
+        url: appendQueryParams(resolvedEndpoint, resolvedQuery),
         method,
         headers,
         body,
-        bodyType
+        bodyType,
+        timeoutMs: Number.isFinite(template.timeoutMs) ? Number(template.timeoutMs) : null,
+        responseParser: template.responseParser || ''
     };
 };
 const applyRequestOverridePatch = (request, patch) => {
@@ -2394,6 +2531,38 @@ const AUTOSAVE_LOCAL_KEY = 'tapnow_autosave';
 const AUTOSAVE_META_KEY = 'tapnow_autosave_meta';
 const AUTOSAVE_IDB_NAME = 'tapnow_autosave_db';
 const AUTOSAVE_IDB_STORE = 'autosave';
+const ASSET_BUNDLE_META_KEY = 'tapnow_asset_bundle_meta';
+
+let assetBundleMetaCache = null;
+const readAssetBundleMeta = () => {
+    if (assetBundleMetaCache) return assetBundleMetaCache;
+    try {
+        const raw = localStorage.getItem(ASSET_BUNDLE_META_KEY);
+        assetBundleMetaCache = raw ? JSON.parse(raw) : null;
+        return assetBundleMetaCache;
+    } catch (e) {
+        assetBundleMetaCache = null;
+        return null;
+    }
+};
+
+const writeAssetBundleMeta = (meta) => {
+    try {
+        assetBundleMetaCache = meta || null;
+        if (!meta) {
+            localStorage.removeItem(ASSET_BUNDLE_META_KEY);
+            return;
+        }
+        localStorage.setItem(ASSET_BUNDLE_META_KEY, JSON.stringify(meta));
+    } catch (e) { }
+};
+
+const getAssetBundleFallbackById = (id) => {
+    if (!id) return '';
+    const meta = readAssetBundleMeta();
+    if (!meta || !meta.idToOriginal) return '';
+    return meta.idToOriginal[id] || '';
+};
 const AUTOSAVE_IDB_KEY = 'latest';
 
 const openAutoSaveDb = () => {
@@ -2475,6 +2644,26 @@ const isVideoUrl = (url) => {
     if (url.includes('force_video_display=true')) return true;
     const ext = url.split('.').pop().split('?')[0].toLowerCase();
     return ['mp4', 'webm', 'ogg', 'mov'].includes(ext);
+};
+
+const getMimeTypeFromPath = (path) => {
+    if (!path || typeof path !== 'string') return '';
+    const clean = path.split('?')[0].split('#')[0];
+    const ext = clean.split('.').pop().toLowerCase();
+    const map = {
+        jpg: 'image/jpeg',
+        jpeg: 'image/jpeg',
+        png: 'image/png',
+        webp: 'image/webp',
+        gif: 'image/gif',
+        bmp: 'image/bmp',
+        svg: 'image/svg+xml',
+        mp4: 'video/mp4',
+        webm: 'video/webm',
+        ogg: 'video/ogg',
+        mov: 'video/quicktime'
+    };
+    return map[ext] || '';
 };
 
 // --- Helper: Load Video Metadata ---
@@ -2618,12 +2807,12 @@ const ImageCompareView = React.memo(({ img1, img2, theme = 'dark' }) => {
                     backgroundPosition: '0 0, 10px 10px'
                 }}
             />
-            <img src={displayImg1} loading="lazy" decoding="async" className="absolute inset-0 w-full h-full object-contain pointer-events-none select-none" draggable={false} />
+            <LazyBase64Image src={displayImg1} loading="lazy" decoding="async" className="absolute inset-0 w-full h-full object-contain pointer-events-none select-none" draggable={false} />
             <div
                 className="absolute inset-0 w-full h-full overflow-hidden pointer-events-none select-none"
                 style={{ clipPath: `inset(0 0 0 ${pos}%)` }}
             >
-                <img src={displayImg2} loading="lazy" decoding="async" className="absolute inset-0 w-full h-full object-contain" draggable={false} />
+                <LazyBase64Image src={displayImg2} loading="lazy" decoding="async" className="absolute inset-0 w-full h-full object-contain" draggable={false} />
             </div>
             <div
                 className="absolute top-0 bottom-0 w-0.5 bg-white/80 shadow-[0_0_10px_rgba(0,0,0,0.5)] pointer-events-none"
@@ -2731,6 +2920,20 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
     useEffect(() => {
         itemRef.current = item;
     }, [item]);
+    const logLightbox = (action, detail = {}) => {
+        const current = itemRef.current || item;
+        console.log('[Lightbox]', action, {
+            id: current?.id,
+            type: current?.type,
+            url: current?.url,
+            mjCount: Array.isArray(current?.mjImages) ? current.mjImages.length : 0,
+            ...detail
+        });
+    };
+    useEffect(() => {
+        if (!item) return;
+        logLightbox('open');
+    }, [item]);
 
     const isVideoItem = item.type === 'video' || (item.url && isVideoUrl(item.url));
     const sourceList = useMemo(() => {
@@ -2749,9 +2952,14 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
         setActiveSrcIndex(0);
     }, [item, sourceList.length]);
     const displayUrl = sourceList[activeSrcIndex] || item.url;
-    const handleMediaError = useCallback(() => {
+    const handleMediaError = () => {
+        logLightbox('media_error', { index: activeSrcIndex, total: sourceList.length });
         setActiveSrcIndex((prev) => (prev < sourceList.length - 1 ? prev + 1 : prev));
-    }, [sourceList.length]);
+    };
+    const handleClose = (reason = 'manual') => {
+        logLightbox('close', { reason });
+        if (onClose) onClose();
+    };
 
     // 键盘事件处理：左右方向键切换图片，上下方向键切换镜头
     useEffect(() => {
@@ -2773,6 +2981,7 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
                 const currentIndex = currentItem.selectedMjImageIndex !== undefined ? currentItem.selectedMjImageIndex : 0;
                 const prevIndex = currentIndex > 0 ? currentIndex - 1 : currentItem.mjImages.length - 1;
                 if (prevIndex >= 0 && prevIndex < currentItem.mjImages.length && onNavigate) {
+                    logLightbox('navigate_left', { from: currentIndex, to: prevIndex, total: currentItem.mjImages.length });
                     // V3.7.22: 立即更新 ref，避免快速按键时状态过时
                     itemRef.current = {
                         ...currentItem,
@@ -2789,6 +2998,7 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
                 const currentIndex = currentItem.selectedMjImageIndex !== undefined ? currentItem.selectedMjImageIndex : 0;
                 const nextIndex = currentIndex < currentItem.mjImages.length - 1 ? currentIndex + 1 : 0;
                 if (nextIndex >= 0 && nextIndex < currentItem.mjImages.length && onNavigate) {
+                    logLightbox('navigate_right', { from: currentIndex, to: nextIndex, total: currentItem.mjImages.length });
                     // V3.7.22: 立即更新 ref，避免快速按键时状态过时
                     itemRef.current = {
                         ...currentItem,
@@ -2804,10 +3014,12 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
                 if (currentItem.storyboardContext && onShotNavigate) {
                     const { shotIndex, allShots } = currentItem.storyboardContext;
                     if (shotIndex > 0) {
+                        logLightbox('shot_up', { from: shotIndex, to: shotIndex - 1, total: allShots.length });
                         onShotNavigate(shotIndex - 1, allShots);
                     }
                 } else if (onHistoryNavigate) {
                     // V3.7.29: 历史项导航（向上 = 更早的项目）
+                    logLightbox('history_up');
                     onHistoryNavigate(-1);
                 }
             } else if (e.key === 'ArrowDown' || e.key === 'Down') {
@@ -2817,17 +3029,19 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
                 if (currentItem.storyboardContext && onShotNavigate) {
                     const { shotIndex, allShots } = currentItem.storyboardContext;
                     if (shotIndex < allShots.length - 1) {
+                        logLightbox('shot_down', { from: shotIndex, to: shotIndex + 1, total: allShots.length });
                         onShotNavigate(shotIndex + 1, allShots);
                     }
                 } else if (onHistoryNavigate) {
                     // V3.7.29: 历史项导航（向下 = 更新的项目）
+                    logLightbox('history_down');
                     onHistoryNavigate(1);
                 }
             } else if (e.key === 'Escape' || e.key === 'Esc') {
                 // V3.7.28: ESC 关闭预览
                 e.preventDefault();
                 e.stopPropagation();
-                if (onClose) onClose();
+                handleClose('esc');
             }
         };
 
@@ -2838,8 +3052,8 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
     }, [item, onNavigate, onShotNavigate, onHistoryNavigate]);
 
     return (
-        <div className="fixed inset-0 z-[200] lightbox-overlay flex flex-col items-center justify-center animate-in fade-in duration-200" onClick={onClose}>
-            <button className="absolute top-4 right-4 text-white/70 hover:text-white p-2 bg-black/50 rounded-full transition-colors" onClick={onClose}><X size={24} /></button>
+        <div className="fixed inset-0 z-[200] lightbox-overlay flex flex-col items-center justify-center animate-in fade-in duration-200" onClick={() => handleClose('overlay')}>
+            <button className="absolute top-4 right-4 text-white/70 hover:text-white p-2 bg-black/50 rounded-full transition-colors" onClick={() => handleClose('button')}><X size={24} /></button>
             <div className="max-w-[90vw] max-h-[85vh] relative" onClick={(e) => e.stopPropagation()}>
                 {item.type === 'image' ? (
                     <LazyBase64Image
@@ -2849,7 +3063,7 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
                         onError={handleMediaError}
                     />
                 ) : (
-                    <video
+                    <ResolvedVideo
                         src={displayUrl}
                         controls
                         autoPlay
@@ -2932,6 +3146,14 @@ function TapnowApp() {
     }, []);
 
     useEffect(() => {
+        window.__APP_BOOTED__ = true;
+        if (window.__APP_BOOT_TIMER__) {
+            clearTimeout(window.__APP_BOOT_TIMER__);
+            window.__APP_BOOT_TIMER__ = null;
+        }
+    }, []);
+
+    useEffect(() => {
         try {
             localStorage.setItem('tapnow_theme', theme);
         } catch (e) { }
@@ -2954,14 +3176,43 @@ function TapnowApp() {
         const meta = readAutoSaveMeta();
         autoSaveUseIdbRef.current = meta?.storage === 'idb';
     }, []);
+    useEffect(() => {
+        const meta = readAssetBundleMeta();
+        if (!meta) return;
+        const idToOriginal = meta.idToOriginal || {};
+        const pathToOriginal = meta.pathToOriginal || {};
+        const pathToId = meta.pathToId || {};
+        const effectivePathToId = { ...pathToId };
+        Object.entries(idToOriginal).forEach(([id, url]) => {
+            if (id && url) assetBundleIdToOriginalRef.current.set(id, url);
+        });
+        Object.entries(pathToOriginal).forEach(([path, url]) => {
+            if (path && url) assetBundlePathToOriginalRef.current.set(path, url);
+        });
+        if (Object.keys(effectivePathToId).length === 0 && Object.keys(idToOriginal).length > 0 && Object.keys(pathToOriginal).length > 0) {
+            const originalToId = new Map(Object.entries(idToOriginal).map(([id, url]) => [url, id]));
+            Object.entries(pathToOriginal).forEach(([path, url]) => {
+                if (!path || !url) return;
+                const mappedId = originalToId.get(url);
+                if (mappedId) effectivePathToId[path] = mappedId;
+            });
+        }
+        Object.entries(effectivePathToId).forEach(([path, id]) => {
+            if (path && id) assetBundlePathToIdRef.current.set(path, id);
+        });
+        if (Object.keys(idToOriginal).length > 0 || Object.keys(pathToOriginal).length > 0 || Object.keys(effectivePathToId).length > 0) {
+            setAssetBundleActive(true);
+        }
+    }, []);
 
     // V3.5.12-a: Auto-save interval for OOM protection (every 60 seconds)
     useEffect(() => {
         const saveInterval = setInterval(() => {
             const saveAuto = async () => {
                 const timestamp = Date.now();
+                const safeNodes = await sanitizeObjectForAutoSave(nodesRef.current);
                 const saveData = {
-                    nodes: nodesRef.current,
+                    nodes: safeNodes,
                     connections: connectionsRef.current,
                     timestamp
                 };
@@ -3410,7 +3661,14 @@ function TapnowApp() {
         return () => window.removeEventListener('keydown', handleKeyDown);
     }, [undo, redo]);
     // === End Undo/Redo ===
-    const [view, setView] = useState({ x: 0, y: 0, zoom: 1 });
+    const [view, setView] = useState(() => ({ ...DEFAULT_VIEW }));
+    const normalizeViewState = (candidate) => {
+        if (!candidate || typeof candidate !== 'object') return { ...DEFAULT_VIEW };
+        const x = Number.isFinite(candidate.x) ? candidate.x : DEFAULT_VIEW.x;
+        const y = Number.isFinite(candidate.y) ? candidate.y : DEFAULT_VIEW.y;
+        const zoom = Number.isFinite(candidate.zoom) && candidate.zoom > 0 ? candidate.zoom : DEFAULT_VIEW.zoom;
+        return { x, y, zoom };
+    };
     // 性能优化：使用 ref 存储 view 和拖拽状态，避免频繁 setState
     const viewRef = useRef({ x: 0, y: 0, zoom: 1 });
     const viewRafRef = useRef(null);
@@ -3806,9 +4064,11 @@ function TapnowApp() {
     });
     const [saveHistoryAssets, setSaveHistoryAssets] = useState(() => {
         try {
-            return localStorage.getItem('tapnow_save_history_assets') === 'true';
+            const saved = localStorage.getItem('tapnow_save_history_assets');
+            if (saved === null) return true;
+            return saved === 'true';
         } catch (e) {
-            return false;
+            return true;
         }
     });
     const [cacheRefreshTick, setCacheRefreshTick] = useState(0);
@@ -3829,8 +4089,186 @@ function TapnowApp() {
     const cachedHistoryUrlRef = useRef(new Map());
     const localCachePathRef = useRef({ savePath: '', imageSavePath: '', videoSavePath: '' });
     const cacheFetchFailureRef = useRef(new Map());
+    const cacheHeadProbeRef = useRef(new Map());
     const cacheImageRunRef = useRef(false);
     const cacheVideoRunRef = useRef(false);
+    const localCacheFileIndexRef = useRef(new Set());
+    const localCacheIndexReadyRef = useRef(false);
+    const [localCacheIndexTick, setLocalCacheIndexTick] = useState(0);
+    const assetBundlePathToOriginalRef = useRef(new Map());
+    const assetBundlePathToIdRef = useRef(new Map());
+    const assetBundleBlobToOriginalRef = useRef(new Map());
+    const assetBundleIdToOriginalRef = useRef(new Map());
+    const assetBundleBlobUrlsRef = useRef(new Set());
+    const [assetBundleActive, setAssetBundleActive] = useState(false);
+    const autoSaveUrlCacheRef = useRef(new Map());
+    const normalizeLocalCacheRelPath = useCallback((value) => {
+        if (!value) return '';
+        return String(value).replace(/\\/g, '/').replace(/^\/+/, '');
+    }, []);
+    const extractLocalCacheRelPath = useCallback((url) => {
+        if (!url) return '';
+        const base = (localServerUrl || '').replace(/\/+$/, '');
+        if (!base || !url.startsWith(base)) return '';
+        const rest = url.slice(base.length);
+        const match = rest.match(/^\/file\/(.+)/);
+        if (!match) return '';
+        try {
+            return normalizeLocalCacheRelPath(decodeURIComponent(match[1]));
+        } catch (e) {
+            return normalizeLocalCacheRelPath(match[1]);
+        }
+    }, [localServerUrl, normalizeLocalCacheRelPath]);
+    const isLocalCacheUrl = useCallback((url) => {
+        if (!url) return false;
+        const str = String(url);
+        const base = (localServerUrl || '').trim().replace(/\/+$/, '');
+        if (base && str.startsWith(`${base}/file/`)) return true;
+        try {
+            const parsed = new URL(str);
+            if ((parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') && parsed.pathname.startsWith('/file/')) {
+                return true;
+            }
+        } catch (e) { }
+        return false;
+    }, [localServerUrl]);
+    const isLocalCacheUrlAvailable = useCallback((url) => {
+        if (!url) return false;
+        const relPath = extractLocalCacheRelPath(url);
+        if (!relPath) return false;
+        // 索引未就绪时，先视为不可用，避免触发 404 噪音
+        if (!localCacheIndexReadyRef.current) return false;
+        return localCacheFileIndexRef.current.has(relPath);
+    }, [extractLocalCacheRelPath, localCacheIndexTick]);
+    const resetAssetBundleState = useCallback((options = {}) => {
+        assetBundlePathToOriginalRef.current.clear();
+        assetBundlePathToIdRef.current.clear();
+        assetBundleBlobToOriginalRef.current.clear();
+        assetBundleIdToOriginalRef.current.clear();
+        assetBundleBlobUrlsRef.current.forEach((url) => {
+            if (url && url.startsWith('blob:')) {
+                try { URL.revokeObjectURL(url); } catch (e) { }
+            }
+        });
+        assetBundleBlobUrlsRef.current.clear();
+        autoSaveUrlCacheRef.current.clear();
+        if (!options.keepStorage) {
+            writeAssetBundleMeta(null);
+        }
+        if (!options.keepActive) {
+            setAssetBundleActive(false);
+        }
+    }, []);
+    const persistAssetBundleMeta = useCallback(() => {
+        const idToOriginal = Object.fromEntries(assetBundleIdToOriginalRef.current);
+        const pathToOriginal = Object.fromEntries(assetBundlePathToOriginalRef.current);
+        const pathToId = Object.fromEntries(assetBundlePathToIdRef.current);
+        if (Object.keys(idToOriginal).length === 0 && Object.keys(pathToOriginal).length === 0 && Object.keys(pathToId).length === 0) {
+            writeAssetBundleMeta(null);
+            return;
+        }
+        writeAssetBundleMeta({
+            idToOriginal,
+            pathToOriginal,
+            pathToId,
+            updatedAt: Date.now()
+        });
+    }, []);
+    const resolveAssetBundleUrl = useCallback((value) => {
+        if (!value || typeof value !== 'string') return value;
+        if (!value.startsWith('asset://')) return value;
+        const path = value.replace(/^asset:\/\//, '');
+        if (!path) return value;
+        return assetBundlePathToIdRef.current.get(path)
+            || assetBundlePathToOriginalRef.current.get(path)
+            || value;
+    }, []);
+    const getAssetFallbackUrl = useCallback((value) => {
+        if (!value || typeof value !== 'string') return '';
+        if (LocalImageManager.isImageId(value)) {
+            return assetBundleIdToOriginalRef.current.get(value) || '';
+        }
+        if (value.startsWith('asset://')) {
+            const path = value.replace(/^asset:\/\//, '');
+            return assetBundlePathToOriginalRef.current.get(path) || '';
+        }
+        if (value.startsWith('blob:')) {
+            return assetBundleBlobToOriginalRef.current.get(value) || '';
+        }
+        return '';
+    }, []);
+    const resolveSpecialUrl = useCallback(async (value) => {
+        if (!value || typeof value !== 'string') return value;
+        let next = value;
+        if (next.startsWith('asset://')) {
+            next = resolveAssetBundleUrl(next);
+        }
+        if (LocalImageManager.isImageId(next)) {
+            const dataUrl = await LocalImageManager.getImage(next);
+            if (dataUrl) return dataUrl;
+            const fallback = getAssetFallbackUrl(next);
+            return fallback || next;
+        }
+        return next;
+    }, [resolveAssetBundleUrl, getAssetFallbackUrl]);
+
+    const resolveUrlForMediaMeta = useCallback(async (value) => {
+        if (!value || typeof value !== 'string') return '';
+        if (LocalImageManager.isImageId(value) || value.startsWith('asset://')) {
+            const resolved = await resolveSpecialUrl(value);
+            return resolved || value;
+        }
+        return value;
+    }, [resolveSpecialUrl]);
+    const getLocalCacheCandidateUrl = useCallback((expectedId, extensions = [], preferHistoryPath = false) => {
+        const base = (localServerUrl || '').trim().replace(/\/+$/, '');
+        if (!base || !expectedId) return '';
+        if (!localCacheIndexReadyRef.current) return '';
+        const segments = [
+            preferHistoryPath ? 'history' : '.tapnow_cache/history',
+            preferHistoryPath ? '.tapnow_cache/history' : 'history'
+        ];
+        const candidates = [];
+        segments.forEach((seg) => {
+            extensions.forEach((ext) => {
+                candidates.push(`${seg}/${expectedId}${ext}`);
+            });
+        });
+        for (const rel of candidates) {
+            const normalized = normalizeLocalCacheRelPath(rel);
+            if (localCacheFileIndexRef.current.has(normalized)) {
+                return `${base}/file/${normalized}`;
+            }
+        }
+        return '';
+    }, [localServerUrl, normalizeLocalCacheRelPath, localCacheIndexTick]);
+
+    const refreshLocalCacheFileIndex = useCallback(async (options = {}) => {
+        if (!localCacheActive) return;
+        const base = (localServerUrl || '').replace(/\/+$/, '');
+        if (!base) return;
+        const silent = options.silent === true;
+        try {
+            const res = await fetch(`${base}/list-files`);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            const files = Array.isArray(data?.files)
+                ? data.files
+                : (Array.isArray(data?.data?.files) ? data.data.files : []);
+            const next = new Set();
+            files.forEach((file) => {
+                const rel = normalizeLocalCacheRelPath(file?.rel_path || file?.relPath || file?.path || '');
+                if (rel) next.add(rel);
+            });
+            localCacheFileIndexRef.current = next;
+            localCacheIndexReadyRef.current = true;
+            setLocalCacheIndexTick((prev) => prev + 1);
+            if (!silent) showToast('本地缓存索引已更新', 'success', 1500);
+        } catch (e) {
+            localCacheIndexReadyRef.current = false;
+            if (!silent) showToast('本地缓存索引更新失败', 'warning', 1500);
+        }
+    }, [localCacheActive, localServerUrl, normalizeLocalCacheRelPath, showToast]);
 
     // 持久化性能模式和本地服务器设置
     useEffect(() => {
@@ -3854,19 +4292,98 @@ function TapnowApp() {
     useEffect(() => {
         try { localStorage.setItem('tapnow_cache_redownload_on_enable', String(cacheRedownloadOnEnable)); } catch (e) { }
     }, [cacheRedownloadOnEnable]);
+    useEffect(() => {
+        if (!localCacheActive) {
+            localCacheIndexReadyRef.current = false;
+            return;
+        }
+        refreshLocalCacheFileIndex({ silent: true });
+    }, [localCacheActive, localServerUrl, localServerConfig.savePath, localServerConfig.imageSavePath, localServerConfig.videoSavePath, cacheRefreshTick, refreshLocalCacheFileIndex]);
+
+    const getHistoryFallbackUrl = (item, options = {}) => {
+        const allowLocalCache = options.allowLocalCache ?? localCacheActive;
+        if (!item) return '';
+        const candidates = [];
+        if (allowLocalCache) {
+            if (item.localCacheUrl) candidates.push(item.localCacheUrl);
+            if (item.localCacheMap && typeof item.localCacheMap === 'object') {
+                candidates.push(...Object.values(item.localCacheMap));
+            }
+        }
+        if (item.localCacheMap && typeof item.localCacheMap === 'object') {
+            candidates.push(...Object.keys(item.localCacheMap));
+        }
+        if (Array.isArray(item.mjImages)) candidates.push(...item.mjImages);
+        if (Array.isArray(item.output_images)) candidates.push(...item.output_images);
+        if (item.originalUrl) candidates.push(item.originalUrl);
+        if (item.mjOriginalUrl) candidates.push(item.mjOriginalUrl);
+        if (item.url) candidates.push(item.url);
+        for (const candidate of candidates) {
+            if (typeof candidate === 'string' && candidate && !candidate.startsWith('blob:')) {
+                if (!allowLocalCache && isLocalCacheUrl(candidate)) continue;
+                return candidate;
+            }
+        }
+        return '';
+    };
+
+    const sanitizeHistoryUrlValue = (value, fallback = '', options = {}) => {
+        const allowLocalCache = options.allowLocalCache ?? localCacheActive;
+        if (!value || typeof value !== 'string') return value;
+        if (!allowLocalCache && isLocalCacheUrl(value)) return fallback || '';
+        if (LocalImageManager.isImageId(value)) return value;
+        if (value.startsWith('asset://')) {
+            const resolved = resolveAssetBundleUrl(value);
+            if (resolved && resolved !== value) return resolved;
+            const assetFallback = getAssetFallbackUrl(value);
+            return assetFallback || value;
+        }
+        if (value.startsWith('blob:')) {
+            return fallback || '';
+        }
+        return value;
+    };
+
+    const sanitizeHistoryItemForLoad = (item) => {
+        const fallback = getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive });
+        const next = { ...item };
+        next.url = sanitizeHistoryUrlValue(next.url, fallback, { allowLocalCache: localCacheActive });
+        next.originalUrl = sanitizeHistoryUrlValue(next.originalUrl, fallback, { allowLocalCache: localCacheActive });
+        next.mjOriginalUrl = sanitizeHistoryUrlValue(next.mjOriginalUrl, fallback, { allowLocalCache: localCacheActive });
+        if (Array.isArray(next.output_images)) {
+            next.output_images = next.output_images.map((url) => sanitizeHistoryUrlValue(url, fallback, { allowLocalCache: localCacheActive })).filter(Boolean);
+        }
+        if (Array.isArray(next.mjImages)) {
+            const sanitized = next.mjImages.map((url) => sanitizeHistoryUrlValue(url, fallback, { allowLocalCache: localCacheActive })).filter(Boolean);
+            if (sanitized.length === 0 && next.mjOriginalUrl) {
+                next.mjImages = null;
+                next.mjNeedsSplit = true;
+            } else {
+                next.mjImages = sanitized;
+            }
+        }
+        if (Array.isArray(next.mjThumbnails)) {
+            next.mjThumbnails = next.mjThumbnails.map((url) => sanitizeHistoryUrlValue(url, fallback, { allowLocalCache: localCacheActive })).filter(Boolean);
+        }
+        if (next.thumbnailUrl) {
+            next.thumbnailUrl = sanitizeHistoryUrlValue(next.thumbnailUrl, fallback, { allowLocalCache: localCacheActive });
+        }
+        return next;
+    };
 
     const [history, setHistory] = useState(() => {
         try {
             const saved = localStorage.getItem('tapnow_history');
             if (!saved) return [];
             const parsed = JSON.parse(saved);
-            // 检查是否有需要重新切割的Midjourney图片
+            // 检查是否有需要重新切割的Midjourney图片 + 修复 blob/asset 残留
             return parsed.map(item => {
-                if (item.mjNeedsSplit && item.mjOriginalUrl && item.apiConfig?.modelId?.includes('mj')) {
+                const sanitized = sanitizeHistoryItemForLoad(item);
+                if (sanitized.mjNeedsSplit && sanitized.mjOriginalUrl && sanitized.apiConfig?.modelId?.includes('mj')) {
                     // 标记需要重新切割，但不立即切割（避免阻塞初始化）
-                    return { ...item, url: item.mjOriginalUrl, mjImages: null, mjNeedsSplit: true };
+                    return { ...sanitized, url: sanitized.mjOriginalUrl, mjImages: null, mjNeedsSplit: true };
                 }
-                return item;
+                return sanitized;
             });
         } catch (e) {
             console.error('加载历史记录失败:', e);
@@ -4239,6 +4756,21 @@ function TapnowApp() {
         return map[mime] || fallback;
     }, []);
 
+    const detectBase64ImageMime = useCallback((raw, fallback = 'image/png') => {
+        if (!raw || typeof raw !== 'string') return fallback;
+        const trimmed = raw.trim();
+        if (!trimmed) return fallback;
+        if (trimmed.startsWith('data:')) {
+            const match = trimmed.match(/^data:([^;]+);/i);
+            return match?.[1]?.toLowerCase() || fallback;
+        }
+        if (trimmed.startsWith('/9j/')) return 'image/jpeg';
+        if (trimmed.startsWith('iVBORw0KGgo')) return 'image/png';
+        if (trimmed.startsWith('R0lGOD')) return 'image/gif';
+        if (trimmed.startsWith('UklGR') && trimmed.toUpperCase().includes('WEBP')) return 'image/webp';
+        return fallback;
+    }, []);
+
     const getUrlExt = useCallback((url, fallback = '') => {
         if (!url) return fallback;
         const clean = url.split('?')[0].split('#')[0];
@@ -4284,7 +4816,8 @@ function TapnowApp() {
         if (!url) throw new Error('Invalid URL');
         const preferLocal = options.preferLocal !== false && localCacheActive;
         const proxyBaseUrl = (options.proxyBaseUrl || localServerUrl || '').trim().replace(/\/+$/, '');
-        const rawUrl = String(url);
+        let rawUrl = String(url);
+        rawUrl = await resolveSpecialUrl(rawUrl);
         const fetchBlob = async (target) => {
             const res = await fetch(target);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -4308,18 +4841,21 @@ function TapnowApp() {
             ? historyLocalCacheMap.get(rawUrl)
             : null;
         if (cachedUrl) {
-            try {
-                if (cachedUrl.startsWith('data:')) {
-                    const normalized = normalizeDataUrl(cachedUrl);
-                    const blob = dataUrlToBlob(normalized);
-                    if (blob) return blob;
-                } else if (cachedUrl.startsWith('blob:')) {
-                    return await fetchBlob(cachedUrl);
-                } else {
-                    return await fetchBlob(cachedUrl);
+            const canUseCached = !isLocalCacheUrl(cachedUrl) || isLocalCacheUrlAvailable(cachedUrl);
+            if (canUseCached) {
+                try {
+                    if (cachedUrl.startsWith('data:')) {
+                        const normalized = normalizeDataUrl(cachedUrl);
+                        const blob = dataUrlToBlob(normalized);
+                        if (blob) return blob;
+                    } else if (cachedUrl.startsWith('blob:')) {
+                        return await fetchBlob(cachedUrl);
+                    } else {
+                        return await fetchBlob(cachedUrl);
+                    }
+                } catch (e) {
+                    // 本地缓存不可用时回退到原始URL
                 }
-            } catch (e) {
-                // 本地缓存不可用时回退到原始URL
             }
         }
         targetUrl = rawUrl;
@@ -4351,16 +4887,40 @@ function TapnowApp() {
         return await fetchBlob(resolvedTarget);
     };
 
+    const coerceImageBlobForJimeng = useCallback(async (blob) => {
+        if (!blob) return blob;
+        const type = (blob.type || '').toLowerCase();
+        if (type.includes('png') || type.includes('jpeg') || type.includes('jpg')) return blob;
+        if (typeof createImageBitmap === 'undefined') return blob;
+        try {
+            const bitmap = await createImageBitmap(blob);
+            const canvas = document.createElement('canvas');
+            canvas.width = bitmap.width || 0;
+            canvas.height = bitmap.height || 0;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return blob;
+            ctx.drawImage(bitmap, 0, 0);
+            const pngBlob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+            return pngBlob || blob;
+        } catch (e) {
+            return blob;
+        }
+    }, []);
+
     // 获取 Base64 字符串（自动识别 Data URL 或 Blob URL 并转换）
     const getBase64FromUrl = async (url, options = {}) => {
-        if (url.startsWith('data:')) {
-            const normalized = normalizeDataUrl(url);
+        let resolvedUrl = url;
+        if (resolvedUrl && typeof resolvedUrl === 'string') {
+            resolvedUrl = await resolveSpecialUrl(resolvedUrl);
+        }
+        if (resolvedUrl && resolvedUrl.startsWith('data:')) {
+            const normalized = normalizeDataUrl(resolvedUrl);
             const blob = dataUrlToBlob(normalized);
             if (!blob) throw new Error('Invalid base64 payload');
             const dataUrl = await blobToDataURL(blob);
             return dataUrl.split(',')[1] || '';
         }
-        const blob = await getBlobFromUrl(url, options);
+        const blob = await getBlobFromUrl(resolvedUrl, options);
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onloadend = () => {
@@ -4381,6 +4941,103 @@ function TapnowApp() {
             reader.readAsDataURL(blob);
         });
     };
+
+    const resolveAutoSaveUrl = useCallback(async (value) => {
+        if (!value || typeof value !== 'string') return value;
+        if (value.startsWith('asset://')) {
+            const resolved = resolveAssetBundleUrl(value);
+            if (resolved && resolved !== value) return resolved;
+            const fallback = getAssetFallbackUrl(value);
+            return fallback || value;
+        }
+        if (!value.startsWith('blob:')) return value;
+        if (autoSaveUrlCacheRef.current.has(value)) return autoSaveUrlCacheRef.current.get(value);
+        const fallback = getAssetFallbackUrl(value);
+        if (fallback) {
+            autoSaveUrlCacheRef.current.set(value, fallback);
+            return fallback;
+        }
+        try {
+            const blob = await getBlobFromUrl(value);
+            if (blob && blob.type && blob.type.startsWith('image/')) {
+                try {
+                    const imgId = await LocalImageManager.saveImage(blob);
+                    if (imgId) {
+                        autoSaveUrlCacheRef.current.set(value, imgId);
+                        return imgId;
+                    }
+                } catch (e) { }
+                const dataUrl = await blobToDataURL(blob);
+                autoSaveUrlCacheRef.current.set(value, dataUrl);
+                return dataUrl;
+            }
+            if (blob && blob.type && blob.type.startsWith('video/')) {
+                if (blob.size <= 8 * 1024 * 1024) {
+                    const dataUrl = await blobToDataURL(blob);
+                    autoSaveUrlCacheRef.current.set(value, dataUrl);
+                    return dataUrl;
+                }
+            }
+        } catch (e) { }
+        autoSaveUrlCacheRef.current.set(value, value);
+        return value;
+    }, [getBlobFromUrl, getAssetFallbackUrl, resolveAssetBundleUrl]);
+
+    const sanitizeObjectForAutoSave = useCallback(async (obj) => {
+        if (obj === null || obj === undefined) return obj;
+        if (typeof obj === 'string') {
+            return await resolveAutoSaveUrl(obj);
+        }
+        if (Array.isArray(obj)) {
+            const next = [];
+            for (let i = 0; i < obj.length; i++) {
+                next[i] = await sanitizeObjectForAutoSave(obj[i]);
+            }
+            return next;
+        }
+        if (typeof obj === 'object') {
+            const next = {};
+            const entries = Object.entries(obj);
+            for (let i = 0; i < entries.length; i++) {
+                const [key, value] = entries[i];
+                next[key] = await sanitizeObjectForAutoSave(value);
+            }
+            return next;
+        }
+        return obj;
+    }, [resolveAutoSaveUrl]);
+
+    const persistAutoSaveSnapshot = useCallback(async (override = {}) => {
+        const snapshotNodes = Array.isArray(override.nodes) ? override.nodes : (nodesRef.current || []);
+        const snapshotConnections = Array.isArray(override.connections) ? override.connections : (connectionsRef.current || []);
+        const timestamp = Date.now();
+        const safeNodes = await sanitizeObjectForAutoSave(snapshotNodes);
+        const saveData = {
+            nodes: safeNodes,
+            connections: snapshotConnections,
+            timestamp
+        };
+        const payload = JSON.stringify(saveData);
+        try {
+            await writeAutoSaveToIdb(payload);
+            autoSaveUseIdbRef.current = true;
+            writeAutoSaveMeta({ timestamp, storage: 'idb' });
+            try { localStorage.removeItem(AUTOSAVE_LOCAL_KEY); } catch (e) { }
+            console.log('[AutoSave] 已立即写入 IndexedDB', new Date().toLocaleTimeString());
+        } catch (e) {
+            try {
+                if (payload.length > 4 * 1024 * 1024) {
+                    throw new Error('payload too large');
+                }
+                localStorage.setItem(AUTOSAVE_LOCAL_KEY, payload);
+                autoSaveUseIdbRef.current = false;
+                writeAutoSaveMeta({ timestamp, storage: 'local' });
+                console.log('[AutoSave] 已立即写入本地存储', new Date().toLocaleTimeString());
+            } catch (err) {
+                console.warn('[AutoSave] 立即保存失败:', err.message || err);
+            }
+        }
+    }, [sanitizeObjectForAutoSave]);
 
     const generateThumbnail = useCallback(async (imageUrl, quality = 'normal', options = {}) => {
         const config = quality === 'ultra'
@@ -4477,6 +5134,14 @@ function TapnowApp() {
         const key = getCacheFailureKey(url);
         cacheFetchFailureRef.current.set(key, Date.now());
     }, [getCacheFailureKey]);
+    const shouldProbeCacheHead = useCallback((url, ttlMs = 60000) => {
+        if (!url) return false;
+        const now = Date.now();
+        const last = cacheHeadProbeRef.current.get(url) || 0;
+        if (now - last < ttlMs) return false;
+        cacheHeadProbeRef.current.set(url, now);
+        return true;
+    }, []);
     const fetchCacheSource = useCallback(async (imageUrl, options = {}) => {
         const useProxy = options.useProxy === true;
         const proxyBaseUrl = options.proxyBaseUrl;
@@ -4522,6 +5187,12 @@ function TapnowApp() {
             if (res.ok) {
                 const data = await res.json();
                 if (data.success) {
+                    const relPath = extractLocalCacheRelPath(data.url);
+                    if (relPath) {
+                        localCacheFileIndexRef.current.add(relPath);
+                        localCacheIndexReadyRef.current = true;
+                        setLocalCacheIndexTick((prev) => prev + 1);
+                    }
                     return { url: data.url, path: data.path };
                 }
             }
@@ -4532,7 +5203,7 @@ function TapnowApp() {
             console.warn('[缓存] 保存图片缓存失败:', e);
         }
         return null;
-    }, [localCacheActive, localServerUrl, getCacheIdFromUrl, getDataUrlExt, getUrlExt, sanitizeCacheId, shouldSkipCacheFetch, fetchCacheSource, recordCacheFetchFailure]);
+    }, [localCacheActive, localServerUrl, getCacheIdFromUrl, getDataUrlExt, getUrlExt, sanitizeCacheId, shouldSkipCacheFetch, fetchCacheSource, recordCacheFetchFailure, extractLocalCacheRelPath]);
 
     const saveVideoToLocalCache = useCallback(async (itemId, videoUrl, category = 'history', options = {}) => {
         if (!localCacheActive) return null;
@@ -4559,6 +5230,12 @@ function TapnowApp() {
             if (saveRes.ok) {
                 const data = await saveRes.json();
                 if (data.success) {
+                    const relPath = extractLocalCacheRelPath(data.url);
+                    if (relPath) {
+                        localCacheFileIndexRef.current.add(relPath);
+                        localCacheIndexReadyRef.current = true;
+                        setLocalCacheIndexTick((prev) => prev + 1);
+                    }
                     return { url: data.url, path: data.path };
                 }
             }
@@ -4569,7 +5246,7 @@ function TapnowApp() {
             console.warn('[缓存] 保存视频缓存失败:', e);
         }
         return null;
-    }, [localCacheActive, localServerUrl, getCacheIdFromUrl, getDataUrlExt, getUrlExt, shouldSkipCacheFetch, fetchCacheSource, recordCacheFetchFailure]);
+    }, [localCacheActive, localServerUrl, getCacheIdFromUrl, getDataUrlExt, getUrlExt, shouldSkipCacheFetch, fetchCacheSource, recordCacheFetchFailure, extractLocalCacheRelPath]);
 
     const updateLocalCacheServerConfig = useCallback(async (patch, options = {}) => {
         const silent = options.silent === true;
@@ -4633,6 +5310,9 @@ function TapnowApp() {
         localCacheCheckRef.current = new Map();
         cachedHistoryUrlRef.current = new Map();
         cacheFetchFailureRef.current = new Map();
+        localCacheFileIndexRef.current = new Set();
+        localCacheIndexReadyRef.current = false;
+        setLocalCacheIndexTick((prev) => prev + 1);
         if (reset) {
             setHistory(prev => prev.map(item => ({
                 ...item,
@@ -4650,7 +5330,8 @@ function TapnowApp() {
         if (!silent) {
             showToast('已触发缓存刷新，将重新写入本地缓存路径', 'success');
         }
-    }, [showToast]);
+        refreshLocalCacheFileIndex({ silent: true });
+    }, [showToast, refreshLocalCacheFileIndex]);
 
     useEffect(() => {
         if (!localCacheActive) return;
@@ -4731,10 +5412,13 @@ function TapnowApp() {
         if (raw.startsWith('data:') || raw.startsWith('blob:')) return false;
         const base = (localServerUrl || '').trim();
         if (base && raw.startsWith(base)) return false;
-        if (localCacheActive && historyLocalCacheMap.has(raw)) return false;
+        if (localCacheActive && historyLocalCacheMap.has(raw)) {
+            const cached = historyLocalCacheMap.get(raw);
+            if (cached && isLocalCacheUrlAvailable(cached)) return false;
+        }
         if (historyUrlProxyMap.has(raw)) return !!historyUrlProxyMap.get(raw);
         return !!fallback;
-    }, [historyUrlProxyMap, historyLocalCacheMap, localServerUrl, localCacheActive]);
+    }, [historyUrlProxyMap, historyLocalCacheMap, localServerUrl, localCacheActive, isLocalCacheUrlAvailable]);
 
     useEffect(() => {
         const nextPath = {
@@ -4760,6 +5444,11 @@ function TapnowApp() {
                     cachedHistoryUrlRef.current.delete(sourceUrl);
                 }
             }
+            const relPath = extractLocalCacheRelPath(failedUrl);
+            if (relPath) {
+                localCacheFileIndexRef.current.delete(relPath);
+                setLocalCacheIndexTick((prev) => prev + 1);
+            }
         }
         setHistory(prev => prev.map(item => {
             if (item.id !== itemId) return item;
@@ -4767,8 +5456,12 @@ function TapnowApp() {
                 return { ...item, localCacheUrl: null, localFilePath: null, localCacheMap: null };
             }
             let nextMap = item.localCacheMap ? { ...item.localCacheMap } : null;
-            if (nextMap && nextMap[failedUrl]) {
-                delete nextMap[failedUrl];
+            if (nextMap) {
+                Object.entries(nextMap).forEach(([sourceUrl, cacheUrl]) => {
+                    if (cacheUrl === failedUrl || sourceUrl === failedUrl) {
+                        delete nextMap[sourceUrl];
+                    }
+                });
             }
             const nextMapKeys = nextMap ? Object.keys(nextMap) : [];
             const nextLocalCacheUrl = item.localCacheUrl === failedUrl
@@ -4785,6 +5478,12 @@ function TapnowApp() {
 
     const normalizeHistoryUrl = (value) => {
         if (!value || typeof value !== 'string') return value;
+        if (value.startsWith('asset://')) {
+            const resolved = resolveAssetBundleUrl(value);
+            if (resolved && resolved !== value) return resolved;
+            const fallback = getAssetFallbackUrl(value);
+            return fallback || value;
+        }
         if (value.startsWith('data:')) return normalizeDataUrl(value);
         return value;
     };
@@ -4794,30 +5493,43 @@ function TapnowApp() {
         if (specificUrl) {
             if (localCacheActive && historyLocalCacheMap && historyLocalCacheMap.has(specificUrl)) {
                 const cached = historyLocalCacheMap.get(specificUrl);
-                if (cached) return cached;
+                if (cached && isLocalCacheUrlAvailable(cached)) return cached;
             }
             if (localCacheActive && item.localCacheMap && item.localCacheMap[specificUrl]) {
                 const cached = item.localCacheMap[specificUrl];
-                if (cached) return cached;
+                if (cached && isLocalCacheUrlAvailable(cached)) return cached;
             }
-            return normalizeHistoryUrl(specificUrl);
+            const normalized = sanitizeHistoryUrlValue(specificUrl, '', { allowLocalCache: localCacheActive });
+            if (!normalized || normalized.startsWith('blob:')) {
+                const fallback = getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive });
+                return normalizeHistoryUrl(fallback || '');
+            }
+            if (!localCacheActive && isLocalCacheUrl(normalized)) {
+                const fallback = getHistoryFallbackUrl(item, { allowLocalCache: false });
+                return normalizeHistoryUrl(fallback || '');
+            }
+            return normalizeHistoryUrl(normalized);
         }
         const cacheUrl = localCacheActive
             ? (item.localCacheUrl || (item.localCacheMap ? Object.values(item.localCacheMap)[0] : null))
             : null;
-        return normalizeHistoryUrl(cacheUrl || item.url || item.originalUrl || item.mjOriginalUrl || '');
-    }, [localCacheActive, historyLocalCacheMap]);
+        if (cacheUrl && isLocalCacheUrlAvailable(cacheUrl)) {
+            return normalizeHistoryUrl(cacheUrl);
+        }
+        const fallback = getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive });
+        return normalizeHistoryUrl(fallback || '');
+    }, [localCacheActive, historyLocalCacheMap, isLocalCacheUrlAvailable, localCacheIndexTick, sanitizeHistoryUrlValue, getHistoryFallbackUrl, isLocalCacheUrl]);
 
     const resolveHistoryPreviewUrl = useCallback((item, specificUrl = null) => {
         if (!item) return '';
         if (specificUrl) {
             if (localCacheActive && historyLocalCacheMap && historyLocalCacheMap.has(specificUrl)) {
                 const cached = historyLocalCacheMap.get(specificUrl);
-                if (cached) return cached;
+                if (cached && isLocalCacheUrlAvailable(cached)) return cached;
             }
             if (localCacheActive && item.localCacheMap && item.localCacheMap[specificUrl]) {
                 const cached = item.localCacheMap[specificUrl];
-                if (cached) return cached;
+                if (cached && isLocalCacheUrlAvailable(cached)) return cached;
             }
             if (performanceMode !== 'off' && item.mjImages && item.mjThumbnails) {
                 const idx = item.mjImages.indexOf(specificUrl);
@@ -4825,16 +5537,43 @@ function TapnowApp() {
                     return item.mjThumbnails[idx];
                 }
             }
-            return normalizeHistoryUrl(specificUrl);
+            const normalized = sanitizeHistoryUrlValue(specificUrl, '', { allowLocalCache: localCacheActive });
+            if (!normalized || normalized.startsWith('blob:')) {
+                const fallback = getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive })
+                    || sanitizeHistoryUrlValue(item.thumbnailUrl, '', { allowLocalCache: localCacheActive });
+                return normalizeHistoryUrl(fallback || '');
+            }
+            if (!localCacheActive && isLocalCacheUrl(normalized)) {
+                const fallback = getHistoryFallbackUrl(item, { allowLocalCache: false })
+                    || sanitizeHistoryUrlValue(item.thumbnailUrl, '', { allowLocalCache: false });
+                return normalizeHistoryUrl(fallback || '');
+            }
+            return normalizeHistoryUrl(normalized);
         }
         const cacheUrl = localCacheActive
             ? (item.localCacheUrl || (item.localCacheMap ? Object.values(item.localCacheMap)[0] : null))
             : null;
         if (performanceMode === 'off') {
-            return normalizeHistoryUrl(cacheUrl || item.url || item.originalUrl || item.mjOriginalUrl || '');
+            if (cacheUrl && isLocalCacheUrlAvailable(cacheUrl)) {
+                return normalizeHistoryUrl(cacheUrl);
+            }
+            const fallback = getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive });
+            return normalizeHistoryUrl(fallback || '');
         }
-        return normalizeHistoryUrl(cacheUrl || item.thumbnailUrl || item.url || item.originalUrl || item.mjOriginalUrl || '');
-    }, [localCacheActive, performanceMode, historyLocalCacheMap]);
+        if (cacheUrl && isLocalCacheUrlAvailable(cacheUrl)) {
+            return normalizeHistoryUrl(cacheUrl);
+        }
+        const fallback = sanitizeHistoryUrlValue(item.thumbnailUrl, '', { allowLocalCache: localCacheActive })
+            || getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive });
+        return normalizeHistoryUrl(fallback || '');
+    }, [localCacheActive, performanceMode, historyLocalCacheMap, isLocalCacheUrlAvailable, localCacheIndexTick, sanitizeHistoryUrlValue, getHistoryFallbackUrl, isLocalCacheUrl]);
+
+    const getHistoryMultiImages = useCallback((item) => {
+        if (!item) return null;
+        if (Array.isArray(item.mjImages) && item.mjImages.length > 1) return item.mjImages;
+        if (Array.isArray(item.output_images) && item.output_images.length > 1) return item.output_images;
+        return null;
+    }, []);
 
     const rebuildHistoryThumbnail = useCallback(async (item, options = {}) => {
         if (!item) return;
@@ -5044,6 +5783,9 @@ function TapnowApp() {
                 const preferHistoryPath = !!(localServerConfig.imageSavePath || localServerConfig.videoSavePath);
                 const expectedSegment = preferHistoryPath ? '/file/history/' : '/file/.tapnow_cache/history/';
                 const localBase = (localServerUrl || '').trim().replace(/\/+$/, '');
+                if (!localCacheIndexReadyRef.current) {
+                    await refreshLocalCacheFileIndex({ silent: true });
+                }
 
                 for (const item of history) {
                 const status = item?.status;
@@ -5060,34 +5802,19 @@ function TapnowApp() {
 
                 const firstCacheUrl = localCacheUrl || (Object.keys(cacheMap).length > 0 ? Object.values(cacheMap)[0] : null);
                 if (firstCacheUrl) {
-                    const canCheck = !String(firstCacheUrl).startsWith('data:') && !String(firstCacheUrl).startsWith('blob:');
-                    const now = Date.now();
-                    const lastCheck = localCacheCheckRef.current.get(item.id) || 0;
-                    if (canCheck && now - lastCheck > 30000) {
-                        localCacheCheckRef.current.set(item.id, now);
-                        let cacheInvalid = false;
-                        try {
-                            const checkRes = await fetch(firstCacheUrl, { method: 'HEAD' });
-                            const contentLength = Number(checkRes.headers.get('content-length') || 0);
-                            if (!checkRes.ok) cacheInvalid = true;
-                            if (contentLength > 0 && contentLength < 128) cacheInvalid = true;
-                        } catch (e) {
-                            cacheInvalid = true;
+                    if (localCacheIndexReadyRef.current && !isLocalCacheUrlAvailable(firstCacheUrl)) {
+                        if (cacheMap && Object.keys(cacheMap).length > 0) {
+                            Object.entries(cacheMap).forEach(([sourceUrl, cacheUrl]) => {
+                                if (cachedHistoryUrlRef.current.get(sourceUrl) === cacheUrl) {
+                                    cachedHistoryUrlRef.current.delete(sourceUrl);
+                                }
+                            });
                         }
-                        if (cacheInvalid) {
-                            if (cacheMap && Object.keys(cacheMap).length > 0) {
-                                Object.entries(cacheMap).forEach(([sourceUrl, cacheUrl]) => {
-                                    if (cachedHistoryUrlRef.current.get(sourceUrl) === cacheUrl) {
-                                        cachedHistoryUrlRef.current.delete(sourceUrl);
-                                    }
-                                });
-                            }
-                            localCacheUrl = null;
-                            localFilePath = null;
-                            cacheMap = {};
-                            cacheMapUpdated = true;
-                            triedCacheIdsRef.current.delete(item.id);
-                        }
+                        localCacheUrl = null;
+                        localFilePath = null;
+                        cacheMap = {};
+                        cacheMapUpdated = true;
+                        triedCacheIdsRef.current.delete(item.id);
                     }
                 }
 
@@ -5152,21 +5879,7 @@ function TapnowApp() {
 
                         // 尝试在当前本地缓存目录中按 cacheId 直接命中已有文件，避免重新拉取远端
                         if (localBase && expectedId) {
-                            const candidates = [
-                                `${localBase}${expectedSegment}${expectedId}.jpg`,
-                                `${localBase}${expectedSegment}${expectedId}.png`,
-                                `${localBase}${expectedSegment}${expectedId}.webp`
-                            ];
-                            let matchedLocal = '';
-                            for (const candidate of candidates) {
-                                try {
-                                    const headRes = await fetch(candidate, { method: 'HEAD' });
-                                    if (headRes.ok) {
-                                        matchedLocal = candidate;
-                                        break;
-                                    }
-                                } catch { }
-                            }
+                            const matchedLocal = getLocalCacheCandidateUrl(expectedId, ['.jpg', '.png', '.webp'], preferHistoryPath);
                             if (matchedLocal) {
                                 if (!cacheMap[imageUrl]) {
                                     cacheMap[imageUrl] = matchedLocal;
@@ -5244,7 +5957,7 @@ function TapnowApp() {
         cacheHistoryImages();
         const timer = setTimeout(cacheHistoryImages, 3000);
         return () => clearTimeout(timer);
-    }, [history, localCacheActive, localServerConfig.imageSavePath, localServerConfig.videoSavePath, localServerUrl, saveImageToLocalCache, sanitizeCacheId, getCacheIdFromUrl, getItemProxyPreference, getProxyPreferenceForUrl, cacheRefreshTick, historyLocalCacheMap, cacheRedownloadOnEnable]);
+    }, [history, localCacheActive, localServerConfig.imageSavePath, localServerConfig.videoSavePath, localServerUrl, saveImageToLocalCache, sanitizeCacheId, getCacheIdFromUrl, getItemProxyPreference, getProxyPreferenceForUrl, cacheRefreshTick, historyLocalCacheMap, cacheRedownloadOnEnable, refreshLocalCacheFileIndex, getLocalCacheCandidateUrl, isLocalCacheUrlAvailable]);
 
     // V2.6.1 Feature: 历史记录本地缓存（视频）
     useEffect(() => {
@@ -5269,6 +5982,9 @@ function TapnowApp() {
                 const savePathRaw = localServerConfig.videoSavePath || localServerConfig.savePath || '';
                 const preferHistoryPath = !!(savePathRaw && !String(savePathRaw).includes('.tapnow_cache'));
                 const expectedSegment = preferHistoryPath ? '/file/history/' : '/file/.tapnow_cache/history/';
+                if (!localCacheIndexReadyRef.current) {
+                    await refreshLocalCacheFileIndex({ silent: true });
+                }
                 for (const item of history) {
                 const status = item?.status;
                 const isCacheableStatus = !status || ['completed', 'complete', 'success', 'done'].includes(status);
@@ -5279,24 +5995,11 @@ function TapnowApp() {
                 const baseProxy = getItemProxyPreference(item);
                 let localCacheUrl = item.localCacheUrl || null;
                 if (localCacheUrl && !cacheRedownloadOnEnable) {
-                    const checkKey = `video:${item.id}`;
-                    const now = Date.now();
-                    const lastCheck = localCacheCheckRef.current.get(checkKey) || 0;
-                    if (now - lastCheck > 30000 && !localCacheUrl.startsWith('data:') && !localCacheUrl.startsWith('blob:')) {
-                        localCacheCheckRef.current.set(checkKey, now);
-                        let cacheInvalid = false;
-                        try {
-                            const checkRes = await fetch(localCacheUrl, { method: 'HEAD' });
-                            if (!checkRes.ok) cacheInvalid = true;
-                        } catch (e) {
-                            cacheInvalid = true;
-                        }
-                        if (cacheInvalid) {
-                            localCacheUrl = null;
-                            setHistory(prev => prev.map(h =>
-                                h.id === item.id ? { ...h, localCacheUrl: null, localFilePath: null } : h
-                            ));
-                        }
+                    if (localCacheIndexReadyRef.current && !isLocalCacheUrlAvailable(localCacheUrl)) {
+                        localCacheUrl = null;
+                        setHistory(prev => prev.map(h =>
+                            h.id === item.id ? { ...h, localCacheUrl: null, localFilePath: null } : h
+                        ));
                     }
                     if (localCacheUrl) continue;
                 }
@@ -5320,21 +6023,7 @@ function TapnowApp() {
                             const cacheId = getCacheIdFromUrl(videoUrl, item.id);
                             const expectedId = sanitizeCacheId(cacheId) || cacheId;
                             if (expectedId) {
-                                const candidates = [
-                                    `${localBase}${expectedSegment}${expectedId}.mp4`,
-                                    `${localBase}${expectedSegment}${expectedId}.webm`,
-                                    `${localBase}${expectedSegment}${expectedId}.mov`
-                                ];
-                                let matchedLocal = '';
-                                for (const candidate of candidates) {
-                                    try {
-                                        const headRes = await fetch(candidate, { method: 'HEAD' });
-                                        if (headRes.ok) {
-                                            matchedLocal = candidate;
-                                            break;
-                                        }
-                                    } catch { }
-                                }
+                                const matchedLocal = getLocalCacheCandidateUrl(expectedId, ['.mp4', '.webm', '.mov'], preferHistoryPath);
                                 if (matchedLocal) {
                                     setHistory(prev => prev.map(h =>
                                         h.id === item.id ? { ...h, localCacheUrl: matchedLocal } : h
@@ -5370,7 +6059,7 @@ function TapnowApp() {
         cacheHistoryVideos();
         const timer = setTimeout(cacheHistoryVideos, 5000);
         return () => clearTimeout(timer);
-    }, [history, localCacheActive, localServerConfig.videoSavePath, localServerConfig.savePath, localServerUrl, saveVideoToLocalCache, getItemProxyPreference, getProxyPreferenceForUrl, cacheRefreshTick, historyLocalCacheMap, cacheRedownloadOnEnable, sanitizeCacheId, getCacheIdFromUrl]);
+    }, [history, localCacheActive, localServerConfig.videoSavePath, localServerConfig.savePath, localServerUrl, saveVideoToLocalCache, getItemProxyPreference, getProxyPreferenceForUrl, cacheRefreshTick, historyLocalCacheMap, cacheRedownloadOnEnable, sanitizeCacheId, getCacheIdFromUrl, refreshLocalCacheFileIndex, getLocalCacheCandidateUrl, isLocalCacheUrlAvailable]);
 
     const canvasRef = useRef(null);
     const lastMousePos = useRef({ x: 0, y: 0 });
@@ -5476,6 +6165,31 @@ function TapnowApp() {
         const previousItems = history.filter(item => (item.startTime || 0) < sessionStartTime);
         return [...sessionItems, ...previousItems];
     }, [history, sessionStartTime]);
+    const isHistoryItemNavigable = useCallback((item) => {
+        if (!item) return false;
+        const status = item?.status;
+        if (status && !['completed', 'complete', 'success', 'done'].includes(status)) return false;
+        return true;
+    }, []);
+    const historyNavItems = useMemo(
+        () => historyDisplayItems.filter(isHistoryItemNavigable),
+        [historyDisplayItems, isHistoryItemNavigable]
+    );
+    const getHistoryNavIndexById = useCallback((id) => {
+        if (!id) return -1;
+        return historyNavItems.findIndex(item => item?.id === id);
+    }, [historyNavItems]);
+    const findHistoryNavIndex = useCallback((items, currentIndex, direction) => {
+        if (!Array.isArray(items) || items.length === 0) return -1;
+        const step = direction < 0 ? -1 : 1;
+        let idx = currentIndex;
+        while (true) {
+            idx += step;
+            if (idx < 0 || idx >= items.length) return -1;
+            const candidate = items[idx];
+            if (isHistoryItemNavigable(candidate)) return idx;
+        }
+    }, [isHistoryItemNavigable]);
 
     // 当视频 URL 改变时清除错误提示
     useEffect(() => {
@@ -5495,17 +6209,19 @@ function TapnowApp() {
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
             // 如果 Lightbox 打开则不处理
             if (lightboxItem) return;
-            if (historyDisplayItems.length === 0) return;
+            if (historyNavItems.length === 0) return;
             let currentIndex = historyFocusId
-                ? historyDisplayItems.findIndex(item => item.id === historyFocusId)
-                : historyFocusIndex;
+                ? getHistoryNavIndexById(historyFocusId)
+                : -1;
             if (currentIndex < 0) currentIndex = 0;
+            if (currentIndex < 0) return;
 
             if (e.key === 'ArrowUp' || e.key === 'Up') {
                 e.preventDefault();
                 e.stopPropagation();
-                const newIdx = currentIndex <= 0 ? historyDisplayItems.length - 1 : currentIndex - 1;
-                const targetItem = historyDisplayItems[newIdx];
+                const newIdx = Math.max(0, currentIndex - 1);
+                if (newIdx === currentIndex) return;
+                const targetItem = historyNavItems[newIdx];
                 const displayUrl = resolveHistoryUrl(targetItem);
                 if (displayUrl) {
                     setLightboxItem({
@@ -5519,8 +6235,9 @@ function TapnowApp() {
             } else if (e.key === 'ArrowDown' || e.key === 'Down') {
                 e.preventDefault();
                 e.stopPropagation();
-                const newIdx = currentIndex >= historyDisplayItems.length - 1 ? 0 : currentIndex + 1;
-                const targetItem = historyDisplayItems[newIdx];
+                const newIdx = Math.min(historyNavItems.length - 1, currentIndex + 1);
+                if (newIdx === currentIndex) return;
+                const targetItem = historyNavItems[newIdx];
                 const displayUrl = resolveHistoryUrl(targetItem);
                 if (displayUrl) {
                     setLightboxItem({
@@ -5540,31 +6257,23 @@ function TapnowApp() {
 
         window.addEventListener('keydown', handleHistoryKeyDown);
         return () => window.removeEventListener('keydown', handleHistoryKeyDown);
-    }, [historyOpen, historyDisplayItems, lightboxItem, resolveHistoryUrl, historyFocusId, historyFocusIndex]);
+    }, [historyOpen, historyNavItems, lightboxItem, resolveHistoryUrl, historyFocusId, historyFocusIndex, getHistoryNavIndexById]);
 
     useEffect(() => {
         if (!historyOpen) return;
-        if (historyDisplayItems.length === 0) {
+        if (historyNavItems.length === 0) {
             setHistoryFocusIndex(-1);
             setHistoryFocusId(null);
             return;
         }
-        if (historyFocusId) {
-            const idx = historyDisplayItems.findIndex(item => item.id === historyFocusId);
-            if (idx >= 0 && idx !== historyFocusIndex) {
-                setHistoryFocusIndex(idx);
-            } else if (idx < 0) {
-                setHistoryFocusId(historyDisplayItems[0]?.id || null);
-                setHistoryFocusIndex(0);
-            }
-        } else {
-            const nextIndex = historyFocusIndex >= 0 && historyFocusIndex < historyDisplayItems.length
-                ? historyFocusIndex
-                : 0;
-            setHistoryFocusIndex(nextIndex);
-            setHistoryFocusId(historyDisplayItems[nextIndex]?.id || null);
+        const idx = historyFocusId ? getHistoryNavIndexById(historyFocusId) : -1;
+        if (idx >= 0) {
+            if (idx !== historyFocusIndex) setHistoryFocusIndex(idx);
+            return;
         }
-    }, [historyOpen, historyDisplayItems, historyFocusId, historyFocusIndex]);
+        setHistoryFocusIndex(0);
+        setHistoryFocusId(historyNavItems[0]?.id || null);
+    }, [historyOpen, historyNavItems, historyFocusId, historyFocusIndex, getHistoryNavIndexById]);
 
     const MAX_HISTORY_LOCAL_STORAGE = 80;
 
@@ -5586,14 +6295,35 @@ function TapnowApp() {
 
     const compactHistoryItemForStorage = (item) => {
         const saved = { ...item };
-        if (saved.url) saved.url = trimHistoryUrlForStorage(saved.url);
-        if (saved.originalUrl) saved.originalUrl = trimHistoryUrlForStorage(saved.originalUrl);
-        if (saved.mjOriginalUrl) saved.mjOriginalUrl = trimHistoryUrlForStorage(saved.mjOriginalUrl);
+        const fallback = getHistoryFallbackUrl(saved, { allowLocalCache: false });
+        if (saved.url) saved.url = trimHistoryUrlForStorage(sanitizeHistoryUrlValue(saved.url, fallback, { allowLocalCache: false }));
+        if (saved.originalUrl) saved.originalUrl = trimHistoryUrlForStorage(sanitizeHistoryUrlValue(saved.originalUrl, fallback, { allowLocalCache: false }));
+        if (saved.mjOriginalUrl) saved.mjOriginalUrl = trimHistoryUrlForStorage(sanitizeHistoryUrlValue(saved.mjOriginalUrl, fallback, { allowLocalCache: false }));
         if (Array.isArray(saved.output_images)) {
-            saved.output_images = saved.output_images.slice(0, 12).map(trimHistoryUrlForStorage);
+            saved.output_images = saved.output_images
+                .slice(0, 12)
+                .map((url) => trimHistoryUrlForStorage(sanitizeHistoryUrlValue(url, fallback, { allowLocalCache: false })))
+                .filter(Boolean);
         }
         if (Array.isArray(saved.mjImages)) {
-            saved.mjImages = saved.mjImages.slice(0, 12).map(trimHistoryUrlForStorage);
+            const sanitized = saved.mjImages
+                .map((url) => sanitizeHistoryUrlValue(url, fallback, { allowLocalCache: false }))
+                .filter(Boolean);
+            if (sanitized.length === 0 && saved.mjOriginalUrl) {
+                saved.mjImages = null;
+                saved.mjNeedsSplit = true;
+            } else {
+                saved.mjImages = sanitized.slice(0, 12).map(trimHistoryUrlForStorage);
+            }
+        }
+        if (Array.isArray(saved.mjThumbnails)) {
+            saved.mjThumbnails = saved.mjThumbnails
+                .map((url) => sanitizeHistoryUrlValue(url, fallback, { allowLocalCache: false }))
+                .filter(Boolean)
+                .map(trimHistoryUrlForStorage);
+        }
+        if (saved.thumbnailUrl) {
+            saved.thumbnailUrl = trimHistoryUrlForStorage(sanitizeHistoryUrlValue(saved.thumbnailUrl, fallback, { allowLocalCache: false }));
         }
         delete saved.mjImageInfo;
         saved.localCacheMap = compactCacheMapForStorage(saved.localCacheMap);
@@ -5648,6 +6378,41 @@ function TapnowApp() {
             }
         }
     }, 1000), []);
+
+    const persistHistorySnapshot = (historyItems = []) => {
+        try {
+            const historyToSave = historyItems
+                .slice(0, MAX_HISTORY_LOCAL_STORAGE)
+                .map((item) => compactHistoryItemForStorage(item));
+            localStorage.setItem('tapnow_history', JSON.stringify(historyToSave));
+            return true;
+        } catch (e) {
+            console.error('立即保存历史记录失败:', e);
+            try {
+                const reduced = historyItems.map(item => ({
+                    id: item.id,
+                    type: item.type,
+                    url: trimHistoryUrlForStorage(item.url),
+                    prompt: item.prompt?.substring(0, 200) || '',
+                    time: item.time,
+                    status: item.status,
+                    modelName: item.modelName,
+                    width: item.width,
+                    height: item.height,
+                    ratio: item.ratio,
+                    mjImages: Array.isArray(item.mjImages) ? item.mjImages.slice(0, 8).map(trimHistoryUrlForStorage) : item.mjImages,
+                    selectedMjImageIndex: item.selectedMjImageIndex,
+                    mjRatio: item.mjRatio,
+                    mjNeedsSplit: item.mjNeedsSplit
+                }));
+                localStorage.setItem('tapnow_history', JSON.stringify(reduced));
+                return true;
+            } catch (e2) {
+                console.error('立即保存历史记录失败（降级后）:', e2);
+                return false;
+            }
+        }
+    };
 
     const debouncedSaveGlobalKey = useMemo(() => debounce((key) => {
         localStorage.setItem('tapnow_global_key', key);
@@ -7885,7 +8650,7 @@ function TapnowApp() {
             ...prev,
             [key]: !prev[key]
         }));
-    }, []);
+    }, [extractLocalCacheRelPath]);
 
     const addModelLibraryCustomParam = (entryId) => {
         if (!entryId) return;
@@ -8245,7 +9010,8 @@ function TapnowApp() {
                 }
                 const base64Like = /^[A-Za-z0-9+/=]+$/.test(trimmed);
                 if (base64Like && trimmed.length > 64) {
-                    urls.add(`data:${mimeHint};base64,${trimmed}`);
+                    const mimeType = detectBase64ImageMime(trimmed, mimeHint);
+                    urls.add(`data:${mimeType};base64,${trimmed}`);
                 }
                 return;
             }
@@ -8257,7 +9023,7 @@ function TapnowApp() {
                 }
                 const raw = value.data || value.base64 || value.b64;
                 if (raw) {
-                    const mimeType = value.mime_type || value.mimeType || mimeHint;
+                    const mimeType = detectBase64ImageMime(raw, value.mime_type || value.mimeType || mimeHint);
                     urls.add(`data:${mimeType};base64,${raw}`);
                 }
             }
@@ -8793,6 +9559,8 @@ function TapnowApp() {
     // 上传单个图片到图床并获取HTTP URL（用于Midjourney的oref和sref指令，以及拓展图片）
     const uploadImageToGetHttpUrl = async (imageUrl, baseUrl, apiKey) => {
         try {
+            const resolvedInput = await resolveSpecialUrl(imageUrl);
+            if (resolvedInput) imageUrl = resolvedInput;
             // 如果是HTTP/HTTPS URL，直接返回
             if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
                 return imageUrl;
@@ -9085,6 +9853,7 @@ function TapnowApp() {
 
     const normalizeHistoryVideoUrl = (url, type) => {
         if (!url) return '';
+        if (LocalImageManager.isImageId(url) || url.startsWith('asset://') || url.startsWith('blob:')) return url;
         if (type === 'video' && !isVideoUrl(url)) {
             return url + (url.includes('?') ? '&' : '?') + 'force_video_display=true';
         }
@@ -9140,7 +9909,10 @@ function TapnowApp() {
                 const isVideo = payload.type === 'video' || isVideoUrl(dragUrl);
                 let dimensions = null;
                 if (!isVideo) {
-                    try { dimensions = await getImageDimensions(dragUrl); } catch { }
+                    try {
+                        const metaUrl = await resolveUrlForMediaMeta(dragUrl);
+                        dimensions = await getImageDimensions(metaUrl);
+                    } catch { }
                 }
                 saveToUndoStack();
                 setNodes((prev) => prev.map((n) => n.id === nodeId
@@ -9155,7 +9927,10 @@ function TapnowApp() {
             const isVideo = isVideoUrl(dragUrlCandidate);
             let dimensions = null;
             if (!isVideo) {
-                try { dimensions = await getImageDimensions(dragUrlCandidate); } catch { }
+                try {
+                    const metaUrl = await resolveUrlForMediaMeta(dragUrlCandidate);
+                    dimensions = await getImageDimensions(metaUrl);
+                } catch { }
             }
             saveToUndoStack();
             setNodes((prev) => prev.map((n) => n.id === nodeId
@@ -11048,11 +11823,12 @@ function TapnowApp() {
         if (rawSourceImages.length > 0) {
             try {
                 resolvedSourceImages = await Promise.all(rawSourceImages.map(async (img) => {
+                    const resolved = await resolveSpecialUrl(img);
+                    if (resolved && resolved !== img) return resolved;
                     if (LocalImageManager.isImageId(img)) {
-                        const blobUrl = await LocalImageManager.getImage(img);
-                        if (blobUrl) return blobUrl;
+                        const fallback = getAssetFallbackUrl(img);
+                        if (fallback) return fallback;
                         console.warn(`[startGeneration] Failed to resolve IDB image: ${img}`);
-                        return img; // Fallback
                     }
                     return img;
                 }));
@@ -12173,7 +12949,8 @@ function TapnowApp() {
                             }
                             const base64Like = /^[A-Za-z0-9+/=]+$/.test(trimmed);
                             if (base64Like && trimmed.length > 64) {
-                                collected.add(`data:${mimeHint};base64,${trimmed}`);
+                                const mimeType = detectBase64ImageMime(trimmed, mimeHint);
+                                collected.add(`data:${mimeType};base64,${trimmed}`);
                             }
                             return;
                         }
@@ -12185,7 +12962,7 @@ function TapnowApp() {
                             }
                             const data = value.data || value.base64 || value.b64;
                             if (data) {
-                                const mimeType = value.mime_type || value.mimeType || mimeHint;
+                                const mimeType = detectBase64ImageMime(data, value.mime_type || value.mimeType || mimeHint);
                                 collected.add(`data:${mimeType};base64,${data}`);
                             }
                         }
@@ -12276,8 +13053,8 @@ function TapnowApp() {
                             return item.url
                                 || item.image_url
                                 || item.imageUrl
-                                || (item.b64_json ? `data:image/png;base64,${item.b64_json}` : null)
-                                || (item.base64 ? `data:image/png;base64,${item.base64}` : null);
+                                || (item.b64_json ? `data:${detectBase64ImageMime(item.b64_json)};base64,${item.b64_json}` : null)
+                                || (item.base64 ? `data:${detectBase64ImageMime(item.base64)};base64,${item.base64}` : null);
                         }).filter(url => typeof url === 'string');
                     } else if (data?.data?.data && Array.isArray(data.data.data)) {
                         // 嵌套格式
@@ -12287,13 +13064,17 @@ function TapnowApp() {
                             return item.url
                                 || item.image_url
                                 || item.imageUrl
-                                || (item.b64_json ? `data:image/png;base64,${item.b64_json}` : null)
-                                || (item.base64 ? `data:image/png;base64,${item.base64}` : null);
+                                || (item.b64_json ? `data:${detectBase64ImageMime(item.b64_json)};base64,${item.b64_json}` : null)
+                                || (item.base64 ? `data:${detectBase64ImageMime(item.base64)};base64,${item.base64}` : null);
                         }).filter(Boolean);
                     }
                 }
 
                 if (imageUrls.length === 0) {
+                    console.warn('[Image Parse] 未找到图片URL', {
+                        keys: data && typeof data === 'object' ? Object.keys(data) : [],
+                        data
+                    });
                     throw new Error('未能在响应中找到图片URL');
                 }
 
@@ -12686,46 +13467,117 @@ function TapnowApp() {
                 // Generic Video Logic (Sora/Kling/etc) - Force Multipart for Image Input with correct field names
                 if (isJimengVideo) {
                     endpoint = `${baseUrl}/v1/videos/generations`;
-                    const formData = new FormData();
                     const allowedDurations = Array.isArray(config?.durations)
                         ? config.durations.map((d) => normalizeDurationValue(d, durationValueNum)).filter((d) => Number.isFinite(d))
                         : (isJimengSora2 ? [4, 8, 12] : [5, 10]);
                     const baseDuration = normalizeJimengVideoDuration(durationValueNum, allowedDurations);
-                    const jimengRatio = normalizeJimengVideoRatio(ratio);
+                    const ratioOptions = isJimengSora2
+                        ? { defaultRatio: 'auto', allowedRatios: ['16:9', '9:16', 'auto'] }
+                        : { defaultRatio: '1:1' };
+                    const jimengRatio = normalizeJimengVideoRatio(ratio, ratioOptions);
                     const modelKey = config?.modelName || modelId || 'jimeng-video-3.0';
                     const supportsResolution = supportsJimengVideoResolution(modelKey);
                     const jimengResolution = supportsResolution ? normalizeJimengVideoResolution(resolution) : '';
 
-                    formData.append('model', modelKey);
-                    formData.append('prompt', prompt);
-                    formData.append('duration', String(baseDuration));
-                    formData.append('ratio', jimengRatio);
-                    if (supportsResolution && jimengResolution) formData.append('resolution', jimengResolution);
+                    const supportsFirstLastFrame = !!config?.supportsFirstLastFrame;
+                    const useFirstLastFrame = supportsFirstLastFrame && !!(node?.settings?.useFirstLastFrame || node?.settings?.veoFramesMode);
+                    const startFrame = useFirstLastFrame ? getConnectedImageForInput(nodeId, 'veo_start') : null;
+                    const endFrame = useFirstLastFrame ? getConnectedImageForInput(nodeId, 'veo_end') : null;
+                    const frameImages = [startFrame, endFrame].filter(Boolean);
+                    const fallbackImages = connectedImages.filter(Boolean);
+                    const baseImages = frameImages.length > 0 ? frameImages : fallbackImages;
+                    const jimengImages = baseImages.slice(0, isJimengSora2 ? 1 : 2);
+                    if (!prompt || !prompt.trim()) throw new Error('提示词不能为空');
 
-                    const jimengImages = connectedImages.filter(Boolean).slice(0, 2);
                     if (jimengImages.length > 0) {
-                        const jimengBlobs = await Promise.all(jimengImages.map((img) => getBlobFromUrl(img, { useProxy: resolveSourceProxy(img) })));
+                        const formData = new FormData();
+                        formData.append('model', modelKey);
+                        formData.append('prompt', prompt);
+                        formData.append('duration', String(baseDuration));
+                        formData.append('ratio', jimengRatio);
+                        if (supportsResolution && jimengResolution) formData.append('resolution', jimengResolution);
+
+                        const jimengBlobs = await Promise.all(jimengImages.map(async (img) => {
+                            const blob = await getBlobFromUrl(img, { useProxy: resolveSourceProxy(img) });
+                            return await coerceImageBlobForJimeng(blob);
+                        }));
                         if (jimengBlobs[0]) formData.append('image_file_1', jimengBlobs[0], 'first.png');
                         if (jimengBlobs[1]) formData.append('image_file_2', jimengBlobs[1], 'last.png');
-                    }
 
-                    applyVideoCustomParams(formData);
+                        applyVideoCustomParams(formData);
+                        if (isJimengSora2) {
+                            formData.delete('image_file_2');
+                            formData.delete('image_file_3');
+                        }
 
-                    const durationOverride = normalizeJimengVideoDuration(formData.get('duration'), allowedDurations);
-                    if (durationOverride) formData.set('duration', String(durationOverride));
+                        const durationOverride = normalizeJimengVideoDuration(formData.get('duration'), allowedDurations);
+                        if (durationOverride) formData.set('duration', String(durationOverride));
 
-                    const ratioOverride = normalizeJimengVideoRatio(formData.get('ratio') || jimengRatio || '1:1');
-                    formData.set('ratio', ratioOverride);
+                        const ratioOverride = normalizeJimengVideoRatio(formData.get('ratio') || jimengRatio || ratioOptions.defaultRatio, ratioOptions);
+                        if (isJimengSora2 && ratioOverride === 'auto') {
+                            formData.delete('ratio');
+                        } else {
+                            formData.set('ratio', ratioOverride);
+                        }
 
-                    const resolutionOverride = supportsResolution
-                        ? normalizeJimengVideoResolution(formData.get('resolution') || jimengResolution)
-                        : '';
-                    if (supportsResolution && resolutionOverride) {
-                        formData.set('resolution', resolutionOverride);
+                        const resolutionOverride = supportsResolution
+                            ? normalizeJimengVideoResolution(formData.get('resolution') || jimengResolution)
+                            : '';
+                        if (supportsResolution && resolutionOverride) {
+                            formData.set('resolution', resolutionOverride);
+                        } else {
+                            formData.delete('resolution');
+                        }
+                        console.log('[Jimeng Video] request', {
+                            model: modelKey,
+                            mode: 'image',
+                            images: jimengImages.length,
+                            duration: formData.get('duration'),
+                            ratio: formData.get('ratio') || 'auto',
+                            resolution: formData.get('resolution') || 'n/a'
+                        });
+                        body = formData;
                     } else {
-                        formData.delete('resolution');
+                        headers['Content-Type'] = 'application/json';
+                        const payload = {
+                            model: modelKey,
+                            prompt: prompt,
+                            duration: baseDuration
+                        };
+                        if (!(isJimengSora2 && jimengRatio === 'auto')) {
+                            payload.ratio = jimengRatio;
+                        }
+                        if (supportsResolution && jimengResolution) payload.resolution = jimengResolution;
+                        applyVideoCustomParams(payload);
+
+                        const durationOverride = normalizeJimengVideoDuration(payload.duration, allowedDurations);
+                        if (durationOverride) payload.duration = durationOverride;
+
+                        const ratioOverride = normalizeJimengVideoRatio(payload.ratio || jimengRatio || ratioOptions.defaultRatio, ratioOptions);
+                        if (isJimengSora2 && ratioOverride === 'auto') {
+                            delete payload.ratio;
+                        } else {
+                            payload.ratio = ratioOverride;
+                        }
+
+                        const resolutionOverride = supportsResolution
+                            ? normalizeJimengVideoResolution(payload.resolution || jimengResolution)
+                            : '';
+                        if (supportsResolution && resolutionOverride) {
+                            payload.resolution = resolutionOverride;
+                        } else {
+                            delete payload.resolution;
+                        }
+                        console.log('[Jimeng Video] request', {
+                            model: modelKey,
+                            mode: 'text',
+                            images: 0,
+                            duration: payload.duration,
+                            ratio: payload.ratio || 'auto',
+                            resolution: payload.resolution || 'n/a'
+                        });
+                        body = JSON.stringify(payload);
                     }
-                    body = formData;
                 } else if (sourceImage) {
                     const formData = new FormData();
                     const blob = await getBlobFromUrl(sourceImage, { useProxy: resolveSourceProxy(sourceImage) });
@@ -13173,9 +14025,288 @@ function TapnowApp() {
         return `${year} -${month} -${day}T${hours} -${minutes} -${seconds} `;
     };
 
+    const isLikelyAssetUrl = (value) => {
+        if (!value || typeof value !== 'string') return false;
+        if (value.startsWith('data:image/') || value.startsWith('data:video/')) return true;
+        if (value.startsWith('blob:')) return true;
+        return /\.(png|jpg|jpeg|webp|gif|mp4|webm|mov)(\?|$)/i.test(value);
+    };
+    const collectAssetUrlsFromObject = (obj, collector) => {
+        if (!obj) return;
+        if (typeof obj === 'string') {
+            if (isLikelyAssetUrl(obj)) collector.add(obj);
+            return;
+        }
+        if (Array.isArray(obj)) {
+            obj.forEach((item) => collectAssetUrlsFromObject(item, collector));
+            return;
+        }
+        if (typeof obj === 'object') {
+            Object.values(obj).forEach((val) => collectAssetUrlsFromObject(val, collector));
+        }
+    };
+    const replaceAssetUrlsInObject = (obj, assetMap) => {
+        if (!obj) return obj;
+        if (typeof obj === 'string') {
+            const mapped = assetMap.get(obj);
+            return mapped ? `asset://${mapped}` : obj;
+        }
+        if (Array.isArray(obj)) {
+            return obj.map((item) => replaceAssetUrlsInObject(item, assetMap));
+        }
+        if (typeof obj === 'object') {
+            const next = {};
+            Object.entries(obj).forEach(([key, val]) => {
+                next[key] = replaceAssetUrlsInObject(val, assetMap);
+            });
+            return next;
+        }
+        return obj;
+    };
+
+    const saveProjectAsBundle = async (projectData, options = {}) => {
+        const zip = new JSZip();
+        const assetMap = new Map();
+        const assetManifest = {};
+        const assetFolder = 'assets';
+        const progress = typeof options.onProgress === 'function' ? options.onProgress : null;
+        const assetCandidates = new Set();
+        const trackCandidate = (url) => {
+            if (!url || typeof url !== 'string') return;
+            assetCandidates.add(url);
+        };
+        history.forEach((item) => {
+            if (!item) return;
+            if (Array.isArray(item.mjImages)) item.mjImages.forEach(trackCandidate);
+            if (Array.isArray(item.output_images)) item.output_images.forEach(trackCandidate);
+            [item.url, item.originalUrl, item.mjOriginalUrl, item.thumbnailUrl, item.localCacheUrl].forEach(trackCandidate);
+            if (item.localCacheMap) {
+                Object.keys(item.localCacheMap).forEach(trackCandidate);
+            }
+        });
+        collectAssetUrlsFromObject(nodes, assetCandidates);
+        collectAssetUrlsFromObject(characterLibrary, assetCandidates);
+        collectAssetUrlsFromObject(chatSessions, assetCandidates);
+        const totalAssets = Math.max(assetCandidates.size, 1);
+        let processedCount = 0;
+        const processedUrls = new Set();
+        const reportProgress = () => {
+            if (!progress) return;
+            progress({ current: processedCount, total: totalAssets, filename: options.filename || '' });
+        };
+        reportProgress();
+        let assetIndex = 0;
+        const addAsset = async (sourceUrl, resolvedUrl, meta = {}) => {
+            if (!sourceUrl || assetMap.has(sourceUrl) || processedUrls.has(sourceUrl)) return;
+            processedUrls.add(sourceUrl);
+            processedCount = processedUrls.size;
+            reportProgress();
+            const fetchUrl = resolvedUrl || sourceUrl;
+            try {
+                let blob;
+                if (fetchUrl.startsWith('data:')) {
+                    blob = dataUrlToBlob(fetchUrl);
+                } else {
+                    const { blob: fetched } = await fetchCacheSource(fetchUrl, {
+                        useProxy: meta.useProxy === true,
+                        preferLocal: true
+                    });
+                    blob = fetched;
+                }
+                if (!blob || blob.size === 0) return;
+                const extFromUrl = getUrlExt(fetchUrl, '');
+                const extFromData = fetchUrl.startsWith('data:') ? getDataUrlExt(fetchUrl, '') : '';
+                const ext = (extFromData || extFromUrl || (blob.type ? `.${blob.type.split('/')[1]}` : '')) || (meta.type === 'video' ? '.mp4' : '.png');
+                const baseId = sanitizeCacheId(meta.cacheId || getCacheIdFromUrl(sourceUrl, meta.itemId || 'asset')) || `asset_${assetIndex++}`;
+                const filename = `${baseId}${meta.suffix || ''}${ext}`;
+                const assetPath = `${assetFolder}/${filename}`;
+                zip.file(assetPath, blob);
+                assetMap.set(sourceUrl, assetPath);
+                assetManifest[sourceUrl] = assetPath;
+                if (resolvedUrl && resolvedUrl !== sourceUrl) {
+                    assetMap.set(resolvedUrl, assetPath);
+                    assetManifest[resolvedUrl] = assetPath;
+                }
+            } catch (e) {
+                console.warn('打包资源失败:', sourceUrl, e);
+            }
+        };
+
+        // 1) 历史记录资产
+        for (const item of history) {
+            if (!item) continue;
+            const baseProxy = getItemProxyPreference(item);
+            const addFromList = async (list, suffixPrefix = '') => {
+                if (!Array.isArray(list)) return;
+                for (let i = 0; i < list.length; i++) {
+                    const rawUrl = list[i];
+                    if (!rawUrl || typeof rawUrl !== 'string') continue;
+                    const resolved = resolveHistoryUrl(item, rawUrl) || rawUrl;
+                    const useProxy = getProxyPreferenceForUrl(resolved, baseProxy);
+                    await addAsset(rawUrl, resolved, { useProxy, itemId: item.id, cacheId: getCacheIdFromUrl(rawUrl, item.id), suffix: suffixPrefix ? `${suffixPrefix}${i + 1}` : `_${i + 1}`, type: item.type });
+                }
+            };
+            await addFromList(item.mjImages, '_mj_');
+            await addFromList(item.output_images, '_out_');
+            const singleUrls = [item.url, item.originalUrl, item.mjOriginalUrl, item.thumbnailUrl, item.localCacheUrl].filter(Boolean);
+            for (const rawUrl of singleUrls) {
+                const resolved = resolveHistoryUrl(item, rawUrl) || rawUrl;
+                const useProxy = getProxyPreferenceForUrl(resolved, baseProxy);
+                await addAsset(rawUrl, resolved, { useProxy, itemId: item.id, cacheId: getCacheIdFromUrl(rawUrl, item.id), type: item.type });
+            }
+            if (item.localCacheMap) {
+                for (const [rawUrl, cacheUrl] of Object.entries(item.localCacheMap)) {
+                    const useProxy = getProxyPreferenceForUrl(cacheUrl, baseProxy);
+                    await addAsset(rawUrl, cacheUrl, { useProxy, itemId: item.id, cacheId: getCacheIdFromUrl(rawUrl, item.id), type: item.type });
+                }
+            }
+        }
+
+        // 2) 节点与角色库资产（兜底扫描）
+        const genericAssets = new Set();
+        collectAssetUrlsFromObject(nodes, genericAssets);
+        collectAssetUrlsFromObject(characterLibrary, genericAssets);
+        collectAssetUrlsFromObject(chatSessions, genericAssets);
+        for (const rawUrl of genericAssets) {
+            if (!rawUrl) continue;
+            await addAsset(rawUrl, rawUrl, { useProxy: false, cacheId: getCacheIdFromUrl(rawUrl, 'node'), type: isVideoUrl(rawUrl) ? 'video' : 'image' });
+        }
+
+        // 3) 写入 project.json（资产 URL 替换为 asset://）
+        const bundleProjectData = replaceAssetUrlsInObject(projectData, assetMap);
+        bundleProjectData.assetBundle = true;
+        bundleProjectData.assetManifest = assetManifest;
+
+        zip.file('project.json', JSON.stringify(bundleProjectData, (key, value) => (value === undefined ? null : value), 2));
+        zip.file('manifest.json', JSON.stringify({ assets: assetManifest }, null, 2));
+
+        const content = await zip.generateAsync({ type: 'blob' });
+        const timestamp = getCSTFilenameTimestamp();
+        const bundleName = `${projectName || '未命名项目'}_${timestamp}.zip`;
+        if (options.handle) {
+            const writable = await options.handle.createWritable();
+            await writable.write(content);
+            await writable.close();
+        } else {
+            saveAs(content, bundleName);
+        }
+        return bundleName;
+    };
+
+    const clearAutoSaveStorage = useCallback(async () => {
+        try { localStorage.removeItem(AUTOSAVE_LOCAL_KEY); } catch (e) { }
+        try { writeAutoSaveMeta(null); } catch (e) { }
+        try {
+            const db = await openAutoSaveDb();
+            await new Promise((resolve) => {
+                const tx = db.transaction(AUTOSAVE_IDB_STORE, 'readwrite');
+                const store = tx.objectStore(AUTOSAVE_IDB_STORE);
+                const req = store.delete(AUTOSAVE_IDB_KEY);
+                req.onsuccess = () => resolve(true);
+                req.onerror = () => resolve(false);
+                tx.oncomplete = () => db.close();
+                tx.onerror = () => db.close();
+            });
+        } catch (e) { }
+    }, []);
+
+    const resetProjectState = useCallback(async (options = {}) => {
+        setNodes([]);
+        setConnections([]);
+        setHistory([]);
+        setHistorySelection(new Set());
+        setSelectedNodeId(null);
+        setSelectedNodeIds(new Set());
+        setUndoStack([]);
+        setRedoStack([]);
+        setLightboxItem(null);
+        setProjectName('未命名项目');
+        setView({ ...DEFAULT_VIEW });
+        setChatSessions([{ id: 'default', title: '新对话', messages: [] }]);
+        setCurrentChatId('default');
+        setChatInput('');
+        setChatFiles([]);
+        setCharacterLibrary([]);
+        setBatchQueue([]);
+        setBatchGroups([]);
+        if (!options.keepAssetBundle) resetAssetBundleState();
+        if (!options.keepAutoSave) await clearAutoSaveStorage();
+        try { localStorage.removeItem('tapnow_project_name'); } catch (e) { }
+    }, [resetAssetBundleState, clearAutoSaveStorage]);
+
     // 功能5：保存项目到JSON文件（流式写入，支持超大文件）
     const handleSaveProject = async () => {
-        const shouldSaveHistoryAssets = !!saveHistoryAssets;
+        // 方案B：统一使用资产包（Zip）保存，避免 base64 膨胀与失败
+        const shouldSaveHistoryAssets = saveHistoryAssets;
+        if (shouldSaveHistoryAssets) {
+            const runBundleSave = async (projectData, bundleName, handle) => {
+                setDownloadProgress({ active: true, current: 0, total: 1, filename: bundleName });
+                try {
+                    await saveProjectAsBundle(projectData, {
+                        handle,
+                        filename: bundleName,
+                        onProgress: ({ current, total, filename }) => {
+                            setDownloadProgress({
+                                active: true,
+                                current,
+                                total: Math.max(total || 0, 1),
+                                filename: filename || bundleName
+                            });
+                        }
+                    });
+                } finally {
+                    setDownloadProgress(prev => ({ ...prev, active: false }));
+                }
+            };
+            try {
+                if (window.showSaveFilePicker) {
+                    const timestamp = getCSTFilenameTimestamp();
+                    const bundleName = `${projectName || '未命名项目'}_${timestamp}.zip`;
+                    const handle = await window.showSaveFilePicker({
+                        suggestedName: bundleName,
+                        types: [{ description: 'Tapnow Bundle', accept: { 'application/zip': ['.zip'] } }],
+                    });
+                    const projectData = {
+                        version: '2.5.7',
+                        projectName,
+                        theme,
+                        nodes,
+                        connections,
+                        view,
+                        history,
+                        chatSessions,
+                        characterLibrary,
+                        modelLibrary,
+                        timestamp: getCSTTimestamp()
+                    };
+                    await runBundleSave(projectData, bundleName, handle);
+                    alert('项目已打包保存！');
+                    return;
+                }
+                const timestamp = getCSTFilenameTimestamp();
+                const bundleName = `${projectName || '未命名项目'}_${timestamp}.zip`;
+                const projectData = {
+                    version: '2.5.7',
+                    projectName,
+                    theme,
+                    nodes,
+                    connections,
+                    view,
+                    history,
+                    chatSessions,
+                    characterLibrary,
+                    modelLibrary,
+                    timestamp: getCSTTimestamp()
+                };
+                await runBundleSave(projectData, bundleName);
+                alert('项目已打包保存！');
+                return;
+            } catch (e) {
+                console.error('项目打包保存失败:', e);
+                alert(`项目打包保存失败: ${e.message || e}`);
+                return;
+            }
+        }
         const convertHistoryAssetUrl = async (url, item, force = false) => {
             if (!url || typeof url !== 'string') return url;
             if (url.startsWith('data:')) return normalizeDataUrl(url);
@@ -13521,6 +14652,21 @@ function TapnowApp() {
         }
     };
 
+    const handleNewProject = useCallback(async () => {
+        const hasContent = (nodes?.length || 0) > 0
+            || (connections?.length || 0) > 0
+            || (history?.length || 0) > 0
+            || (chatSessions?.length || 0) > 1
+            || (characterLibrary?.length || 0) > 0;
+        if (hasContent) {
+            const shouldSave = confirm('当前项目有内容，建议先保存。\n\n点击“确定”先保存再新建，点击“取消”直接新建。');
+            if (shouldSave) {
+                await handleSaveProject();
+            }
+        }
+        await resetProjectState();
+    }, [nodes, connections, history, chatSessions, characterLibrary, handleSaveProject, resetProjectState]);
+
     // 保存选中的工作流（框选节点后右键保存）
     const handleSaveSelectedWorkflow = async () => {
         try {
@@ -13827,16 +14973,166 @@ function TapnowApp() {
     };
 
     // 功能5：从JSON文件加载项目（流式读取，支持超大文件，修复多行JSON解析问题，解决内存泄露）
+    const applyLoadedProjectState = (tempState) => {
+        if (!tempState || typeof tempState !== 'object') return;
+        setProjectName(tempState.projectName || '未命名项目');
+        setView(normalizeViewState(tempState.view));
+        if (tempState.connections?.length > 0) setConnections(tempState.connections);
+        if (tempState.chatSessions?.length > 0) setChatSessions(tempState.chatSessions);
+        if (tempState.characterLibrary?.length > 0) setCharacterLibrary(tempState.characterLibrary);
+        const shouldLoadModelLibrary = tempState.modelLibraryLoaded || (Array.isArray(tempState.modelLibrary) && tempState.modelLibrary.length > 0);
+        if (shouldLoadModelLibrary) {
+            const normalizedLibrary = (tempState.modelLibrary || [])
+                .map((entry) => ({
+                    id: entry.id,
+                    displayName: entry.displayName || entry.id,
+                    modelName: entry.modelName || entry.id,
+                    type: entry.type || 'Chat',
+                    apiType: entry.apiType || 'openai',
+                    ratioLimits: Array.isArray(entry.ratioLimits) ? entry.ratioLimits : null,
+                    ratioNotes: normalizeValueNotes(entry.ratioNotes),
+                    ratioNotesEnabled: !!entry.ratioNotesEnabled,
+                    resolutionLimits: Array.isArray(entry.resolutionLimits) ? entry.resolutionLimits : null,
+                    resolutionNotes: normalizeResolutionNotes(entry.resolutionNotes),
+                    resolutionNotesEnabled: !!entry.resolutionNotesEnabled,
+                    durations: Array.isArray(entry.durations) ? entry.durations : null,
+                    durationNotes: normalizeValueNotes(entry.durationNotes),
+                    durationNotesEnabled: !!entry.durationNotesEnabled,
+                    videoResolutions: Array.isArray(entry.videoResolutions) ? entry.videoResolutions : null,
+                    videoResolutionNotes: normalizeValueNotes(entry.videoResolutionNotes),
+                    videoResolutionNotesEnabled: !!entry.videoResolutionNotesEnabled,
+                    supportsFirstLastFrame: !!entry.supportsFirstLastFrame,
+                    supportsHD: !!entry.supportsHD,
+                    customParams: normalizeCustomParams(entry.customParams),
+                    requestTemplate: normalizeRequestTemplate(entry.requestTemplate || getDefaultRequestTemplateForType(entry.type || 'Chat')),
+                    requestOverrideEnabled: !!entry.requestOverrideEnabled,
+                    requestOverridePatch: normalizeRequestOverridePatch(entry.requestOverridePatch),
+                    previewOverrideEnabled: !!entry.previewOverrideEnabled,
+                    previewOverridePatch: normalizePreviewOverridePatch(entry.previewOverridePatch)
+                }))
+                .filter((entry) => entry.id);
+            setModelLibrary(normalizedLibrary);
+        }
+        if (['dark', 'light', 'solarized'].includes(tempState.theme)) {
+            setTheme(tempState.theme);
+        }
+        if (tempState.nodes?.length > 0) setNodes(tempState.nodes);
+        if (tempState.history?.length > 0) setHistory(tempState.history);
+    };
+
+    const importProjectBundle = async (file) => {
+        setProgressState({ visible: true, progress: 0, status: 'READING BUNDLE...', type: 'import' });
+        try {
+            resetAssetBundleState({ keepStorage: true, keepActive: true });
+            const zip = await JSZip.loadAsync(file);
+            const projectFile = zip.file(/project\.json$/i)?.[0];
+            if (!projectFile) throw new Error('未找到 project.json');
+            const projectText = await projectFile.async('string');
+            const projectData = JSON.parse(projectText || '{}');
+            const assetFiles = zip.file(/^assets\//);
+            const assetManifest = projectData.assetManifest || {};
+            const pathToOriginal = new Map();
+            Object.entries(assetManifest).forEach(([original, path]) => {
+                if (path) pathToOriginal.set(path, original);
+            });
+            assetBundlePathToOriginalRef.current.clear();
+            pathToOriginal.forEach((value, key) => assetBundlePathToOriginalRef.current.set(key, value));
+            const assetUrlMap = new Map();
+            for (const asset of assetFiles) {
+                const blob = await asset.async('blob');
+                const assetPath = asset.name;
+                const originalUrl = pathToOriginal.get(assetPath) || '';
+                const mimeFromPath = getMimeTypeFromPath(assetPath);
+                const isImageAsset = (blob?.type && blob.type.startsWith('image/')) || mimeFromPath.startsWith('image/');
+                const isVideoAsset = (blob?.type && blob.type.startsWith('video/')) || mimeFromPath.startsWith('video/');
+                const typedBlob = blob && (!blob.type && mimeFromPath)
+                    ? new Blob([blob], { type: mimeFromPath })
+                    : blob;
+
+                if (isImageAsset || isVideoAsset) {
+                    try {
+                        const assetId = await LocalImageManager.saveImage(typedBlob);
+                        if (assetId) {
+                            assetUrlMap.set(assetPath, assetId);
+                            assetBundlePathToIdRef.current.set(assetPath, assetId);
+                            if (originalUrl) assetBundleIdToOriginalRef.current.set(assetId, originalUrl);
+                            continue;
+                        }
+                    } catch (e) { }
+                }
+                const url = URL.createObjectURL(typedBlob);
+                assetUrlMap.set(assetPath, url);
+                assetBundleBlobUrlsRef.current.add(url);
+                if (originalUrl) assetBundleBlobToOriginalRef.current.set(url, originalUrl);
+            }
+            setAssetBundleActive(true);
+            persistAssetBundleMeta();
+            const applyAssetBundle = (obj) => {
+                if (!obj) return obj;
+                if (typeof obj === 'string') {
+                    if (obj.startsWith('asset://')) {
+                        const path = obj.replace('asset://', '');
+                        const mapped = assetUrlMap.get(path);
+                        if (mapped) return mapped;
+                        const fallback = assetBundlePathToOriginalRef.current.get(path);
+                        return fallback || obj;
+                    }
+                    const mappedPath = assetManifest[obj];
+                    if (mappedPath) {
+                        const mapped = assetUrlMap.get(mappedPath);
+                        if (mapped) return mapped;
+                        const fallback = assetBundlePathToOriginalRef.current.get(mappedPath);
+                        if (fallback) return fallback;
+                    }
+                    return obj;
+                }
+                if (Array.isArray(obj)) return obj.map(applyAssetBundle);
+                if (typeof obj === 'object') {
+                    const next = {};
+                    Object.entries(obj).forEach(([key, val]) => {
+                        next[key] = applyAssetBundle(val);
+                    });
+                    return next;
+                }
+                return obj;
+            };
+            const hydratedProject = applyAssetBundle(projectData);
+            setTimeout(() => {
+                applyLoadedProjectState(hydratedProject);
+                setProgressState(prev => ({ ...prev, visible: false }));
+                alert(`加载成功！\n${hydratedProject.nodes?.length || 0} 个节点`);
+                persistAutoSaveSnapshot({
+                    nodes: hydratedProject.nodes || [],
+                    connections: hydratedProject.connections || []
+                }).catch((err) => {
+                    console.warn('[AutoSave] 导入后立即保存失败:', err);
+                });
+                if (Array.isArray(hydratedProject.history)) {
+                    persistHistorySnapshot(hydratedProject.history);
+                }
+            }, 100);
+        } catch (error) {
+            console.error('加载资产包失败:', error);
+            setProgressState(prev => ({ ...prev, visible: false }));
+            alert(`加载失败: ${error.message || error} `);
+        }
+    };
+
     const handleLoadProject = () => {
         const input = document.createElement('input');
         input.type = 'file';
-        input.accept = '.json';
+        input.accept = '.json,.zip';
         input.onchange = async (e) => {
             const file = e.target.files[0];
             if (!file) return;
 
             // 初始化进度
             setProgressState({ visible: true, progress: 0, status: 'INITIALIZING...', type: 'import' });
+
+            if (file.name && file.name.toLowerCase().endsWith('.zip')) {
+                await importProjectBundle(file);
+                return;
+            }
 
             // --- 尝试获取本地库文件列表（用于优先使用本地文件）---
             let localFiles = [];
@@ -14035,48 +15331,18 @@ function TapnowApp() {
 
                 // 批量更新 State
                 setTimeout(() => {
-                    // V3.4.6: 项目名称初始化修复 - 没有项目名时用"未命名项目"
-                    setProjectName(tempState.projectName || '未命名项目');
-                    if (tempState.view) setView(tempState.view);
-                    if (tempState.connections.length > 0) setConnections(tempState.connections);
-                    if (tempState.chatSessions.length > 0) setChatSessions(tempState.chatSessions);
-                    if (tempState.characterLibrary.length > 0) setCharacterLibrary(tempState.characterLibrary);
-                    if (tempState.modelLibraryLoaded) {
-                        const normalizedLibrary = tempState.modelLibrary
-                            .map((entry) => ({
-                                id: entry.id,
-                                displayName: entry.displayName || entry.id,
-                                modelName: entry.modelName || entry.id,
-                                type: entry.type || 'Chat',
-                                apiType: entry.apiType || 'openai',
-                                ratioLimits: Array.isArray(entry.ratioLimits) ? entry.ratioLimits : null,
-                                ratioNotes: normalizeValueNotes(entry.ratioNotes),
-                                ratioNotesEnabled: !!entry.ratioNotesEnabled,
-                                resolutionLimits: Array.isArray(entry.resolutionLimits) ? entry.resolutionLimits : null,
-                                resolutionNotes: normalizeResolutionNotes(entry.resolutionNotes),
-                                resolutionNotesEnabled: !!entry.resolutionNotesEnabled,
-                                durations: Array.isArray(entry.durations) ? entry.durations : null,
-                                durationNotes: normalizeValueNotes(entry.durationNotes),
-                                durationNotesEnabled: !!entry.durationNotesEnabled,
-                                videoResolutions: Array.isArray(entry.videoResolutions) ? entry.videoResolutions : null,
-                                videoResolutionNotes: normalizeValueNotes(entry.videoResolutionNotes),
-                                videoResolutionNotesEnabled: !!entry.videoResolutionNotesEnabled,
-                                supportsFirstLastFrame: !!entry.supportsFirstLastFrame,
-                                supportsHD: !!entry.supportsHD,
-                                customParams: normalizeCustomParams(entry.customParams)
-                            }))
-                            .filter((entry) => entry.id);
-                        setModelLibrary(normalizedLibrary);
-                    }
-                    if (['dark', 'light', 'solarized'].includes(tempState.theme)) {
-                        setTheme(tempState.theme);
-                    }
-
-                    if (tempState.nodes.length > 0) setNodes(tempState.nodes);
-                    if (tempState.history.length > 0) setHistory(tempState.history);
-
+                    applyLoadedProjectState(tempState);
                     setProgressState(prev => ({ ...prev, visible: false }));
                     alert(`加载成功！\n${tempState.nodes.length} 个节点`);
+                    persistAutoSaveSnapshot({
+                        nodes: tempState.nodes,
+                        connections: tempState.connections
+                    }).catch((err) => {
+                        console.warn('[AutoSave] 导入后立即保存失败:', err);
+                    });
+                    if (Array.isArray(tempState.history)) {
+                        persistHistorySnapshot(tempState.history);
+                    }
                 }, 200);
 
             } catch (error) {
@@ -16859,7 +18125,10 @@ ${inputText.substring(0, 15000)} ... (截断)
                 const isVideo = payload.type === 'video' || isVideoUrl(dragUrl);
                 if (isVideo) {
                     let videoMeta = { duration: 0, w: 0, h: 0 };
-                    try { videoMeta = await getVideoMetadata(dragUrl); } catch { }
+                    try {
+                        const metaUrl = await resolveUrlForMediaMeta(dragUrl);
+                        videoMeta = await getVideoMetadata(metaUrl);
+                    } catch { }
                     saveToUndoStack();
                     setNodes(prev => prev.map(n =>
                         n.id === nodeId
@@ -16877,7 +18146,10 @@ ${inputText.substring(0, 15000)} ... (截断)
         if (dragUrlCandidate) {
             if (isVideoUrl(dragUrlCandidate)) {
                 let videoMeta = { duration: 0, w: 0, h: 0 };
-                try { videoMeta = await getVideoMetadata(dragUrlCandidate); } catch { }
+                try {
+                    const metaUrl = await resolveUrlForMediaMeta(dragUrlCandidate);
+                    videoMeta = await getVideoMetadata(metaUrl);
+                } catch { }
                 saveToUndoStack();
                 setNodes(prev => prev.map(n =>
                     n.id === nodeId
@@ -17639,14 +18911,18 @@ ${inputText.substring(0, 15000)} ... (截断)
 
         let dims = undefined;
         if (!isVideo) {
-            try { dims = await getImageDimensions(url); } catch { }
+            try {
+                const metaUrl = await resolveUrlForMediaMeta(url);
+                dims = await getImageDimensions(metaUrl);
+            } catch { }
         }
 
         const newNode = addNode(nodeType, worldX, worldY, null, url, dims, targetNode.id);
 
         if (isVideo && newNode?.id) {
             try {
-                const videoMeta = await getVideoMetadata(url);
+                const metaUrl = await resolveUrlForMediaMeta(url);
+                const videoMeta = await getVideoMetadata(metaUrl);
                 setNodes(prev => prev.map(n =>
                     n.id === newNode.id
                         ? { ...n, content: url, videoMeta, frames: [], selectedKeyframes: [], extractingFrames: false, videoFileName: '' }
@@ -17656,7 +18932,7 @@ ${inputText.substring(0, 15000)} ... (截断)
         }
 
         return true;
-    }, [addNode, getDefaultNodeSize, setNodes]);
+    }, [addNode, getDefaultNodeSize, resolveUrlForMediaMeta, setNodes]);
 
     const applyHistoryToNode = async (targetNode, item) => {
         if (!targetNode) return false;
@@ -17664,7 +18940,7 @@ ${inputText.substring(0, 15000)} ... (截断)
         if (!resolvedUrl) return false;
 
         if (targetNode.type === 'preview') {
-            const previewImages = item.mjImages && item.mjImages.length > 1 ? item.mjImages : null;
+            const previewImages = getHistoryMultiImages(item);
             const selectedIndex = item.selectedMjImageIndex ?? 0;
             const previewUrl = previewImages ? (previewImages[selectedIndex] || previewImages[0]) : resolvedUrl;
             setNodes(prev => prev.map(n =>
@@ -17678,7 +18954,10 @@ ${inputText.substring(0, 15000)} ... (截断)
         if (targetNode.type === 'input-image') {
             let dimensions = null;
             if (!isVideoUrl(resolvedUrl)) {
-                try { dimensions = await getImageDimensions(resolvedUrl); } catch { }
+                try {
+                    const metaUrl = await resolveUrlForMediaMeta(resolvedUrl);
+                    dimensions = await getImageDimensions(metaUrl);
+                } catch { }
             }
             setNodes(prev => prev.map(n =>
                 n.id === targetNode.id
@@ -17691,7 +18970,10 @@ ${inputText.substring(0, 15000)} ... (截断)
         if (targetNode.type === 'video-input') {
             if (item.type === 'video' || isVideoUrl(resolvedUrl)) {
                 let videoMeta = { duration: 0, w: 0, h: 0 };
-                try { videoMeta = await getVideoMetadata(resolvedUrl); } catch { }
+                try {
+                    const metaUrl = await resolveUrlForMediaMeta(resolvedUrl);
+                    videoMeta = await getVideoMetadata(metaUrl);
+                } catch { }
                 setNodes(prev => prev.map(n =>
                     n.id === targetNode.id
                         ? { ...n, content: resolvedUrl, videoMeta, frames: [], selectedKeyframes: [], extractingFrames: false, videoFileName: '' }
@@ -18878,7 +20160,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                     {node.type === 'input-image' && node.content && (
                         <div className="w-full h-full relative">
                             {isVideoUrl(node.content) ? (
-                                <video
+                                <ResolvedVideo
                                     src={node.content}
                                     className="w-full h-full object-cover opacity-80"
                                     muted
@@ -18894,7 +20176,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                         </div>
                     )}
                     {node.type === 'video-input' && node.content && (
-                        <video
+                        <ResolvedVideo
                             src={node.content}
                             className="w-full h-full object-cover opacity-80"
                             muted
@@ -19999,7 +21281,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                     }}
                                                     onMouseDown={(e) => e.stopPropagation()}
                                                 >
-                                                    <video
+                                                    <ResolvedVideo
                                                         src={resolvedVideoUrl}
                                                         controls
                                                         className="w-full h-full object-contain"
@@ -20701,7 +21983,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                             {node.content ? (
                                 <div className="relative w-full h-full">
                                     {isVideoUrl(node.content) ? (
-                                        <video
+                                        <ResolvedVideo
                                             src={node.content}
                                             controls
                                             className={`w-full h-full object-contain ${theme === 'dark'
@@ -20720,7 +22002,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             }}
                                         />
                                     ) : (
-                                        <img
+                                        <LazyBase64Image
                                             src={node.content}
                                             className={`w-full h-full object-contain ${theme === 'dark'
                                                 ? 'bg-black/50'
@@ -20944,7 +22226,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 className="relative w-full max-w-[360px] aspect-video bg-black rounded-lg overflow-hidden flex items-center justify-center mx-auto"
                                                 onDrop={(e) => handleVideoDrop(node.id, e)} /* V3.5.20: Explicit drop zone */
                                             >
-                                                <video
+                                                <ResolvedVideo
                                                     src={node.content}
                                                     controls
                                                     className="w-full h-full object-contain"
@@ -21650,7 +22932,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                             return (
                                                                                 <div key={kfIdx} className="relative aspect-video bg-black rounded overflow-hidden">
                                                                                     {imageUrl ? (
-                                                                                        <img src={imageUrl} className="w-full h-full object-cover" alt={`关键帧 ${kfIdx + 1}`} loading="lazy" />
+                                                                                        <LazyBase64Image src={imageUrl} className="w-full h-full object-cover" alt={`关键帧 ${kfIdx + 1}`} loading="lazy" />
                                                                                     ) : (
                                                                                         <div className="w-full h-full flex items-center justify-center text-[8px] text-zinc-500">
                                                                                             {kf.type === 'prev' ? '上一帧' : kf.type === 'current' ? '当前帧' : '下一帧'}
@@ -24202,7 +25484,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     >
                                         {node.content || (node.previewMjImages && node.previewMjImages.length > 0) ? (
                                             isVideoUrl(node.content) || node.previewType === 'video' ? (
-                                                <video
+                                                <ResolvedVideo
                                                     src={node.content}
                                                     className={`w-full h-full object-contain ${theme === 'dark'
                                                         ? 'bg-black'
@@ -24226,7 +25508,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     : 'bg-zinc-100'
                                                                 }`}
                                                         >
-                                                            <img
+                                                            <LazyBase64Image
                                                                 src={imgUrl}
                                                                 className="max-w-full max-h-full w-auto h-auto object-contain"
                                                                 alt={`预览图 ${idx + 1}`}
@@ -25441,6 +26723,18 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 {projectName}
                             </span>
                         )}
+                        <button
+                            onClick={handleNewProject}
+                            className={`p-1 rounded-md border transition-colors ${theme === 'dark'
+                                ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                                : theme === 'solarized'
+                                    ? 'border-[#d7cfb2] text-[#586e75] hover:bg-[#fdf6e3]'
+                                    : 'border-zinc-300 text-zinc-600 hover:bg-zinc-100'
+                                }`}
+                            title="新建空项目（清空当前内容）"
+                        >
+                            <Plus size={12} />
+                        </button>
                     </div>
                     <div className="flex items-center gap-2">
                         {/* 性能模式开关 V2.6.1 */}
@@ -25563,7 +26857,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                         </button>
                         <Button
                             variant="ghost"
-                            onClick={() => { saveToUndoStack(); setNodes([]); setConnections([]); setProjectName('未命名项目'); localStorage.removeItem('tapnow_project_name'); }}
+                            onClick={handleNewProject}
                             className={theme === 'solarized' ? '!bg-[#616161] !border !border-[#525252] !text-[#fdf6e3] hover:!bg-[#555555]' : ''}
                         >
                             清空
@@ -26277,6 +27571,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             onDelete={deleteHistoryItem}
                                                             getHistoryMeta={getHistoryMeta}
                                                             resolveHistoryUrl={resolveHistoryUrl}
+                                                            isLocalCacheUrlAvailable={isLocalCacheUrlAvailable}
                                                             isSelected={historySelection.has(item.id)}
                                                             onSelect={(id) => {
                                                                 setHistorySelection(prev => {
@@ -26288,11 +27583,14 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             }}
                                                             onClick={() => {
                                                                 setHistoryFocusId(item.id);
-                                                                const currentIndex = item.mjImages && item.mjImages.length > 1
-                                                                    ? (item.selectedMjImageIndex !== undefined ? item.selectedMjImageIndex : 0)
+                                                                const multiImages = getHistoryMultiImages(item);
+                                                                const maxIndex = multiImages
+                                                                    ? multiImages.length - 1
                                                                     : 0;
-                                                                const selectedUrl = item.mjImages && item.mjImages.length > 1
-                                                                    ? item.mjImages[currentIndex]
+                                                                const rawIndex = item.selectedMjImageIndex !== undefined ? item.selectedMjImageIndex : 0;
+                                                                const currentIndex = Math.max(0, Math.min(rawIndex, maxIndex));
+                                                                const selectedUrl = multiImages
+                                                                    ? multiImages[currentIndex]
                                                                     : null;
                                                                 const displayUrl = selectedUrl
                                                                     ? resolveHistoryUrl(item, selectedUrl)
@@ -26364,6 +27662,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             onDelete={deleteHistoryItem}
                                                             getHistoryMeta={getHistoryMeta}
                                                             resolveHistoryUrl={resolveHistoryUrl}
+                                                            isLocalCacheUrlAvailable={isLocalCacheUrlAvailable}
                                                             isSelected={historySelection.has(item.id)}
                                                             onSelect={(id) => {
                                                                 setHistorySelection(prev => {
@@ -26375,11 +27674,14 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             }}
                                                             onClick={() => {
                                                                 setHistoryFocusId(item.id);
-                                                                const currentIndex = item.mjImages && item.mjImages.length > 1
-                                                                    ? (item.selectedMjImageIndex !== undefined ? item.selectedMjImageIndex : 0)
+                                                                const multiImages = getHistoryMultiImages(item);
+                                                                const maxIndex = multiImages
+                                                                    ? multiImages.length - 1
                                                                     : 0;
-                                                                const selectedUrl = item.mjImages && item.mjImages.length > 1
-                                                                    ? item.mjImages[currentIndex]
+                                                                const rawIndex = item.selectedMjImageIndex !== undefined ? item.selectedMjImageIndex : 0;
+                                                                const currentIndex = Math.max(0, Math.min(rawIndex, maxIndex));
+                                                                const selectedUrl = multiImages
+                                                                    ? multiImages[currentIndex]
                                                                     : null;
                                                                 const displayUrl = selectedUrl
                                                                     ? resolveHistoryUrl(item, selectedUrl)
@@ -27924,34 +29226,31 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 const currentItem = lightboxItemRef.current;
                                 if (!currentItem || currentItem.storyboardContext) return; // 分镜模式不使用历史导航
 
-                                // 找到当前项在历史中的位置
-                                const currentIndex = history.findIndex(h => h.id === currentItem.id);
+                                const items = historyDisplayItems;
+                                if (!items.length) return;
+                                const currentIndex = items.findIndex(h => h.id === currentItem.id);
                                 if (currentIndex === -1) return;
 
-                                // 查找下一个有图片的历史项
-                                let targetIndex = currentIndex + direction;
-                                while (targetIndex >= 0 && targetIndex < history.length) {
-                                    const candidate = history[targetIndex];
-                                    if (candidate.url && candidate.status === 'completed') {
-                                        // 找到有效项目
-                                        // V3.8: 切换组时始终重置 selectedMjImageIndex 为 0
-                                        const imgIndex = 0;
-                                        const selectedUrl = candidate.mjImages && candidate.mjImages.length > 1
-                                            ? candidate.mjImages[imgIndex]
-                                            : candidate.url;
-                                        const resolvedUrl = selectedUrl
-                                            ? resolveHistoryUrl(candidate, selectedUrl)
-                                            : resolveHistoryUrl(candidate);
-                                        setLightboxItem({
-                                            ...candidate,
-                                            url: resolvedUrl,
-                                            selectedMjImageIndex: imgIndex,
-                                            storyboardContext: null
-                                        });
-                                        return;
-                                    }
-                                    targetIndex += direction;
-                                }
+                                const targetIndex = findHistoryNavIndex(items, currentIndex, direction);
+                                if (targetIndex < 0) return;
+                                const candidate = items[targetIndex];
+                                if (!candidate) return;
+                                // V3.8: 切换组时始终重置 selectedMjImageIndex 为 0
+                                const imgIndex = 0;
+                                const selectedUrl = candidate.mjImages && candidate.mjImages.length > 1
+                                    ? candidate.mjImages[imgIndex]
+                                    : candidate.url;
+                                const resolvedUrl = selectedUrl
+                                    ? resolveHistoryUrl(candidate, selectedUrl)
+                                    : resolveHistoryUrl(candidate);
+                                setHistoryFocusId(candidate.id);
+                                setHistoryFocusIndex(targetIndex);
+                                setLightboxItem({
+                                    ...candidate,
+                                    url: resolvedUrl,
+                                    selectedMjImageIndex: imgIndex,
+                                    storyboardContext: null
+                                });
                             }}
                         />
 
@@ -28030,7 +29329,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 <div className="grid grid-cols-2 gap-3 mt-2">
                                                     <div>
                                                         <div className="flex items-center justify-between mb-1">
-                                                            <span className={`text-xs ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>保存历史资产</span>
+                                                            <span className={`text-xs ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>保存资产包（Zip）</span>
                                                             <button
                                                                 className={`w-10 h-5 rounded-full relative transition-colors ${saveHistoryAssets ? 'bg-blue-600' : theme === 'dark' ? 'bg-zinc-700' : 'bg-zinc-300'}`}
                                                                 onClick={() => setSaveHistoryAssets(prev => !prev)}
@@ -28038,7 +29337,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                 <div className={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all ${saveHistoryAssets ? 'left-6' : 'left-1'}`} />
                                                             </button>
                                                         </div>
-                                                        <p className="text-[9px] text-zinc-500">保存项目时将历史图片/视频写入文件，体积会增大。</p>
+                                                        <p className="text-[9px] text-zinc-500">导出时打包历史图片/视频与项目文件，便于离线恢复。</p>
                                                     </div>
                                                     <div>
                                                         <div className="flex flex-col gap-1">
@@ -28828,7 +30127,11 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 headers: JSON.stringify(requestTemplateValue?.headers || {}, null, 2),
                                                 body: requestTemplateValue?.bodyType === 'raw'
                                                     ? String(requestTemplateValue?.body ?? '')
-                                                    : JSON.stringify(requestTemplateValue?.body || {}, null, 2)
+                                                    : JSON.stringify(requestTemplateValue?.body || {}, null, 2),
+                                                query: JSON.stringify(requestTemplateValue?.query || {}, null, 2),
+                                                files: JSON.stringify(requestTemplateValue?.files || {}, null, 2),
+                                                timeoutMs: requestTemplateValue?.timeoutMs ?? '',
+                                                responseParser: requestTemplateValue?.responseParser || ''
                                             };
                                             const updateRequestTemplate = (updates) => {
                                                 const nextTemplate = normalizeRequestTemplate({
@@ -29556,6 +30859,73 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         />
                                                                     </div>
                                                                 </div>
+                                                                <div className="grid grid-cols-12 gap-2 mt-2">
+                                                                    <div className="col-span-6 space-y-1">
+                                                                        <label className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>Query（JSON）</label>
+                                                                        <textarea
+                                                                            value={requestTemplateDraft.query}
+                                                                            onChange={(e) => setLibraryRequestTemplateDrafts(prev => ({
+                                                                                ...prev,
+                                                                                [entry.id]: { ...requestTemplateDraft, query: e.target.value }
+                                                                            }))}
+                                                                            disabled={!isEditing}
+                                                                            className={`w-full h-20 text-[9px] rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-900 border-zinc-800 text-zinc-200'
+                                                                                : 'bg-white border-zinc-300 text-zinc-800'
+                                                                                }`}
+                                                                        />
+                                                                    </div>
+                                                                    <div className="col-span-6 space-y-1">
+                                                                        <label className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>Files（JSON）</label>
+                                                                        <textarea
+                                                                            value={requestTemplateDraft.files}
+                                                                            onChange={(e) => setLibraryRequestTemplateDrafts(prev => ({
+                                                                                ...prev,
+                                                                                [entry.id]: { ...requestTemplateDraft, files: e.target.value }
+                                                                            }))}
+                                                                            disabled={!isEditing}
+                                                                            className={`w-full h-20 text-[9px] rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-900 border-zinc-800 text-zinc-200'
+                                                                                : 'bg-white border-zinc-300 text-zinc-800'
+                                                                                }`}
+                                                                        />
+                                                                    </div>
+                                                                </div>
+                                                                <div className="grid grid-cols-12 gap-2 mt-2">
+                                                                    <div className="col-span-4 space-y-1">
+                                                                        <label className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>超时（ms）</label>
+                                                                        <input
+                                                                            type="number"
+                                                                            min="0"
+                                                                            value={requestTemplateDraft.timeoutMs}
+                                                                            onChange={(e) => setLibraryRequestTemplateDrafts(prev => ({
+                                                                                ...prev,
+                                                                                [entry.id]: { ...requestTemplateDraft, timeoutMs: e.target.value }
+                                                                            }))}
+                                                                            disabled={!isEditing}
+                                                                            className={`w-full text-[10px] rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-900 border-zinc-800 text-zinc-300'
+                                                                                : 'bg-white border-zinc-300 text-zinc-900'
+                                                                                }`}
+                                                                        />
+                                                                    </div>
+                                                                    <div className="col-span-8 space-y-1">
+                                                                        <label className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>响应解析器</label>
+                                                                        <input
+                                                                            value={requestTemplateDraft.responseParser}
+                                                                            onChange={(e) => setLibraryRequestTemplateDrafts(prev => ({
+                                                                                ...prev,
+                                                                                [entry.id]: { ...requestTemplateDraft, responseParser: e.target.value }
+                                                                            }))}
+                                                                            disabled={!isEditing}
+                                                                            placeholder="例如：openai.image / jimeng.video"
+                                                                            className={`w-full text-[10px] rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-900 border-zinc-800 text-zinc-300 placeholder-zinc-600'
+                                                                                : 'bg-white border-zinc-300 text-zinc-900 placeholder-zinc-400'
+                                                                                }`}
+                                                                        />
+                                                                    </div>
+                                                                </div>
                                                                 <div className="flex items-center justify-between mt-2">
                                                                     <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
                                                                         变量示例：{'{{prompt}}'}, {'{{duration:number}}'}, {'{{image:blob}}'}, {'{{size}}'}
@@ -29566,9 +30936,19 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                 try {
                                                                                     const headersText = requestTemplateDraft.headers?.trim() || '{}';
                                                                                     const bodyText = requestTemplateDraft.body ?? '';
+                                                                                    const queryText = requestTemplateDraft.query?.trim() || '{}';
+                                                                                    const filesText = requestTemplateDraft.files?.trim() || '{}';
                                                                                     const parsedHeaders = headersText ? JSON.parse(headersText) : {};
                                                                                     if (!parsedHeaders || typeof parsedHeaders !== 'object' || Array.isArray(parsedHeaders)) {
                                                                                         throw new Error('请求头必须是对象');
+                                                                                    }
+                                                                                    const parsedQuery = queryText ? JSON.parse(queryText) : {};
+                                                                                    if (!parsedQuery || typeof parsedQuery !== 'object' || Array.isArray(parsedQuery)) {
+                                                                                        throw new Error('Query 必须是对象');
+                                                                                    }
+                                                                                    const parsedFiles = filesText ? JSON.parse(filesText) : {};
+                                                                                    if (!parsedFiles || typeof parsedFiles !== 'object' || Array.isArray(parsedFiles)) {
+                                                                                        throw new Error('Files 必须是对象');
                                                                                     }
                                                                                     let parsedBody = bodyText;
                                                                                     if ((requestTemplateValue?.bodyType || 'json') !== 'raw') {
@@ -29578,7 +30958,22 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                             throw new Error('请求体必须是对象');
                                                                                         }
                                                                                     }
-                                                                                    updateRequestTemplate({ headers: parsedHeaders, body: parsedBody });
+                                                                                    const timeoutRaw = requestTemplateDraft.timeoutMs;
+                                                                                    const timeoutMs = timeoutRaw === '' || timeoutRaw === null || timeoutRaw === undefined
+                                                                                        ? null
+                                                                                        : Number(timeoutRaw);
+                                                                                    if (timeoutMs !== null && (!Number.isFinite(timeoutMs) || timeoutMs < 0)) {
+                                                                                        throw new Error('超时必须是非负数字');
+                                                                                    }
+                                                                                    const responseParser = (requestTemplateDraft.responseParser || '').trim();
+                                                                                    updateRequestTemplate({
+                                                                                        headers: parsedHeaders,
+                                                                                        body: parsedBody,
+                                                                                        query: parsedQuery,
+                                                                                        files: parsedFiles,
+                                                                                        timeoutMs,
+                                                                                        responseParser
+                                                                                    });
                                                                                     setLibraryRequestTemplateDrafts(prev => {
                                                                                         const { [entry.id]: _removed, ...rest } = prev;
                                                                                         return rest;
@@ -30086,8 +31481,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 const displayUrl = mappedPreviewImages
                                                     ? (mappedPreviewImages[safeIndex] || mappedPreviewImages[0])
                                                     : baseUrl;
+                                                const resolvedDisplayUrl = resolveHistoryUrl(item, displayUrl);
+                                                const resolvedGridImages = gridImages
+                                                    ? gridImages.map((img) => resolveHistoryUrl(item, img)).filter(Boolean)
+                                                    : null;
                                                 const hasBackendCache = !!(localCacheActive && (item.localCacheUrl || item.localFilePath || (item.localCacheMap && Object.keys(item.localCacheMap).length > 0)));
-                                                const isVideoItem = item.type === 'video' || (displayUrl ? isVideoUrl(displayUrl) : false);
+                                                const isVideoItem = item.type === 'video' || (resolvedDisplayUrl ? isVideoUrl(resolvedDisplayUrl) : false);
                                                 const ratioValue = item.ratio || item.mjRatio || '';
                                                 const rawResolution = item.resolution || (item.width && item.height ? `${item.width}x${item.height}` : '');
                                                 const resolutionValue = rawResolution ? rawResolution.replace(/p$/i, '') : '';
@@ -30122,14 +31521,14 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     <Check size={16} className="text-white" />
                                                                 </div>
                                                             )}
-                                                            {item.status === 'completed' && displayUrl && (
+                                                            {item.status === 'completed' && resolvedDisplayUrl && (
                                                                 <button
                                                                     onClick={(e) => {
                                                                         e.stopPropagation();
                                                                         // 准备要显示的item，确保包含正确的url和selectedMjImageIndex
                                                                         const displayItem = {
                                                                             ...item,
-                                                                            url: displayUrl,
+                                                                            url: resolvedDisplayUrl,
                                                                             selectedMjImageIndex: previewImages && previewImages.length > 1
                                                                                 ? safeIndex
                                                                                 : undefined
@@ -30148,7 +31547,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         </div>
 
                                                         {/* 缩略图 */}
-                                                        <div className={`relative ${((item.mjImages && (item.mjImages.length === 4 || item.mjImages.length > 1)) || (item.mjNeedsSplit && item.apiConfig?.modelId?.includes('mj')))
+                                                        <div className={`relative ${((previewImages && previewImages.length > 1) || (item.mjNeedsSplit && item.apiConfig?.modelId?.includes('mj')))
                                                             ? (() => {
                                                                 const ratio = item.mjRatio || '1:1';
                                                                 if (ratio === '16:9') return 'aspect-video';
@@ -30165,18 +31564,18 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     后端缓存
                                                                 </div>
                                                             )}
-                                                            {item.status === 'completed' && (displayUrl || (gridImages && gridImages.length > 0)) ? (
+                                                            {item.status === 'completed' && (resolvedDisplayUrl || (resolvedGridImages && resolvedGridImages.length > 0)) ? (
                                                                 isVideoItem ? (
-                                                                    <video
-                                                                        src={displayUrl}
+                                                                    <ResolvedVideo
+                                                                        src={resolvedDisplayUrl}
                                                                         className="w-full h-full object-contain"
                                                                         controls
                                                                         playsInline
                                                                         preload="metadata"
                                                                     />
-                                                                ) : gridImages && gridImages.length > 0 ? (
+                                                                ) : resolvedGridImages && resolvedGridImages.length > 0 ? (
                                                                     <div className="grid grid-cols-2 grid-rows-2 w-full h-full">
-                                                                        {gridImages.map((img, idx) => {
+                                                                        {resolvedGridImages.map((img, idx) => {
                                                                             const isActive = gridSelectedIndex === idx;
                                                                             return (
                                                                                 <div
@@ -30211,7 +31610,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     </div>
                                                                 ) : (
                                                                     <LazyBase64Image
-                                                                        src={displayUrl}
+                                                                        src={resolvedDisplayUrl}
                                                                         className="w-full h-full object-contain"
                                                                         alt="生成图"
                                                                         onError={(e) => {
