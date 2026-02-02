@@ -2075,6 +2075,24 @@ const normalizeCustomParams = (params) => {
         };
     }).filter(Boolean);
 };
+const getImageSourceFallbackByParam = (paramName, imageSources = []) => {
+    if (!paramName || !Array.isArray(imageSources) || imageSources.length === 0) return null;
+    const lower = String(paramName).toLowerCase();
+    let index = null;
+    if (lower.includes('imagea')) index = 0;
+    else if (lower.includes('imageb')) index = 1;
+    else if (lower.includes('imagec')) index = 2;
+    else if (lower.includes('imaged')) index = 3;
+    if (index === null) {
+        const numberMatch = lower.match(/image(?:_|-)?(\d+)/);
+        if (numberMatch) {
+            const parsed = parseInt(numberMatch[1], 10);
+            if (Number.isFinite(parsed) && parsed > 0) index = parsed - 1;
+        }
+    }
+    if (index === null) return null;
+    return imageSources[index] || null;
+};
 function getDefaultRequestTemplateForType(type) {
     const modelType = type || 'Chat';
     let endpoint = '/v1/images/generations';
@@ -2342,6 +2360,40 @@ const normalizeAsyncConfig = (config) => {
         ? normalized.failureValues.map(v => v.toUpperCase())
         : ['FAILED', 'ERROR', 'CANCELLED', 'CANCELED', 'FAILURE'];
     return normalized;
+};
+const normalizeModelLibraryEntry = (entry, index = 0) => {
+    if (!entry || typeof entry !== 'object') return null;
+    const rawId = String(entry.id || entry.modelName || entry.displayName || '').trim();
+    const id = rawId || `library-${Date.now()}-${Math.random().toString(36).slice(2, 6)}-${index}`;
+    return {
+        id,
+        displayName: entry.displayName || entry.modelName || id,
+        modelName: entry.modelName || entry.displayName || id,
+        type: entry.type || 'Chat',
+        apiType: entry.apiType || 'openai',
+        ratioLimits: Array.isArray(entry.ratioLimits) ? entry.ratioLimits : null,
+        ratioNotes: normalizeValueNotes(entry.ratioNotes),
+        ratioNotesEnabled: !!entry.ratioNotesEnabled,
+        resolutionLimits: Array.isArray(entry.resolutionLimits) ? entry.resolutionLimits : null,
+        resolutionNotes: normalizeResolutionNotes(entry.resolutionNotes),
+        resolutionNotesEnabled: !!entry.resolutionNotesEnabled,
+        durations: Array.isArray(entry.durations) ? entry.durations : null,
+        durationNotes: normalizeValueNotes(entry.durationNotes),
+        durationNotesEnabled: !!entry.durationNotesEnabled,
+        videoResolutions: Array.isArray(entry.videoResolutions) ? entry.videoResolutions : null,
+        videoResolutionNotes: normalizeValueNotes(entry.videoResolutionNotes),
+        videoResolutionNotesEnabled: !!entry.videoResolutionNotesEnabled,
+        supportsFirstLastFrame: !!entry.supportsFirstLastFrame,
+        supportsHD: !!entry.supportsHD,
+        customParams: normalizeCustomParams(entry.customParams),
+        asyncConfig: normalizeAsyncConfig(entry.asyncConfig),
+        previewOverrideEnabled: !!entry.previewOverrideEnabled,
+        previewOverridePatch: normalizePreviewOverridePatch(entry.previewOverridePatch),
+        requestTemplate: normalizeRequestTemplate(entry.requestTemplate || getDefaultRequestTemplateForEntry(entry)),
+        requestOverrideEnabled: !!entry.requestOverrideEnabled,
+        requestOverridePatch: normalizeRequestOverridePatch(entry.requestOverridePatch),
+        responseParser: entry.responseParser || ''
+    };
 };
 const normalizeRequestOverridePatch = (patch) => {
     return normalizePreviewOverridePatch(patch);
@@ -10319,6 +10371,20 @@ function TapnowApp() {
         link.click();
         URL.revokeObjectURL(link.href);
     }, []);
+    const exportModelLibraryEntry = useCallback((entry) => {
+        if (!entry) return;
+        const normalized = normalizeModelLibraryEntry(entry);
+        if (!normalized) return;
+        const safeName = String(normalized.id || 'model').replace(/[^\w.-]+/g, '_');
+        const blob = new Blob([JSON.stringify(normalized, null, 2)], { type: 'application/json' });
+        const fileName = `tapnow-model-library-${safeName}.json`;
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = fileName;
+        link.click();
+        URL.revokeObjectURL(link.href);
+        showToast('模型库模型已导出', 'success', 2000);
+    }, [showToast]);
 
     const importApiModelConfigs = useCallback((providerKey) => {
         const input = document.createElement('input');
@@ -10365,6 +10431,48 @@ function TapnowApp() {
                 showToast(`已导入 ${normalized.length} 个模型`, 'success', 3000);
             } catch (err) {
                 showToast(`导入失败: ${err.message}`, 'error', 3000);
+            }
+        };
+        input.click();
+    }, [showToast]);
+    const importModelLibraryEntries = useCallback(() => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json';
+        input.onchange = async (e) => {
+            const file = e.target.files?.[0];
+            if (!file) return;
+            try {
+                const text = await file.text();
+                const data = JSON.parse(text);
+                const rawList = Array.isArray(data)
+                    ? data
+                    : Array.isArray(data?.modelLibrary)
+                        ? data.modelLibrary
+                        : [data];
+                const normalized = rawList
+                    .map((entry, idx) => normalizeModelLibraryEntry(entry, idx))
+                    .filter(Boolean);
+                if (normalized.length === 0) {
+                    showToast('未识别到可导入的模型库配置', 'warning', 2000);
+                    return;
+                }
+                setModelLibrary((prev) => {
+                    const existingIds = new Set(prev.map(item => item.id));
+                    const next = [...prev];
+                    normalized.forEach((entry) => {
+                        let id = entry.id;
+                        if (existingIds.has(id)) {
+                            id = `${id}-${Math.random().toString(36).slice(2, 6)}`;
+                        }
+                        existingIds.add(id);
+                        next.push({ ...entry, id });
+                    });
+                    return next;
+                });
+                showToast('模型库导入完成', 'success', 2000);
+            } catch (err) {
+                showToast('模型库导入失败：JSON 无效', 'error', 2000);
             }
         };
         input.click();
@@ -13284,7 +13392,13 @@ function TapnowApp() {
                             const name = String(param?.name || '').trim();
                             if (!name) return;
                             const value = getCustomParamSelection(param, customParamSelections);
-                            if (value === '' || value === undefined || value === null) return;
+                            if (value === '' || value === undefined || value === null) {
+                                const fallback = getImageSourceFallbackByParam(name, imageSources);
+                                if (fallback) {
+                                    vars[name] = fallback;
+                                }
+                                return;
+                            }
                             vars[name] = value;
                         });
                     }
@@ -13379,7 +13493,13 @@ function TapnowApp() {
                                 const name = String(param?.name || '').trim();
                                 if (!name) return;
                                 const value = getCustomParamSelection(param, customParamSelections);
-                                if (value === '' || value === undefined || value === null) return;
+                                if (value === '' || value === undefined || value === null) {
+                                    const fallback = getImageSourceFallbackByParam(name, imageSources);
+                                    if (fallback) {
+                                        vars[name] = fallback;
+                                    }
+                                    return;
+                                }
                                 vars[name] = value;
                             });
                         }
@@ -21467,7 +21587,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                             : theme === 'dark' ? 'hover:bg-zinc-800 text-zinc-300' : theme === 'solarized' ? 'hover:bg-[#fdf6e3] text-zinc-700' : 'hover:bg-zinc-100 text-zinc-700'
                                                                             }`}
                                                                     >
-                                                                        <span className="text-[10px] font-medium truncate font-mono">{m.displayName || m.modelName || m.id}</span>
+                                                                        <span className="text-[10px] font-medium truncate font-mono">{getModelLabelWithProvider(m._uid || m.id)}</span>
                                                                         <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${getStatusColor(modelKey)}`}></div>
                                                                     </button>
                                                                 );
@@ -21754,7 +21874,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                     : theme === 'dark' ? 'hover:bg-zinc-800 text-zinc-300' : theme === 'solarized' ? 'hover:bg-[#fdf6e3] text-zinc-700' : 'hover:bg-zinc-100 text-zinc-700'
                                                                                     }`}
                                                                             >
-                                                                                <span className="text-[10px] font-medium truncate font-mono">{m.displayName || m.modelName || m.id}</span>
+                                                                                <span className="text-[10px] font-medium truncate font-mono">{getModelLabelWithProvider(m._uid || m.id)}</span>
                                                                                 <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${getStatusColor(modelKey)}`}></div>
                                                                             </button>
                                                                         );
@@ -21995,7 +22115,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                     : theme === 'dark' ? 'hover:bg-zinc-800 text-zinc-300' : theme === 'solarized' ? 'hover:bg-[#fdf6e3] text-zinc-700' : 'hover:bg-zinc-100 text-zinc-700'
                                                                                     }`}
                                                                             >
-                                                                                <span className="text-[10px] font-medium truncate font-mono">{m.displayName || m.modelName || m.id}</span>
+                                                                                <span className="text-[10px] font-medium truncate font-mono">{getModelLabelWithProvider(m._uid || m.id)}</span>
                                                                                 <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${getStatusColor(modelKey)}`}></div>
                                                                             </button>
                                                                         );
@@ -22268,7 +22388,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                     : theme === 'dark' ? 'hover:bg-zinc-800 text-zinc-300' : theme === 'solarized' ? 'hover:bg-[#fdf6e3] text-zinc-700' : 'hover:bg-zinc-100 text-zinc-700'
                                                                                     }`}
                                                                             >
-                                                                                <span className="text-[10px] font-medium truncate font-mono">{m.displayName || m.modelName || m.id}</span>
+                                                                                <span className="text-[10px] font-medium truncate font-mono">{getModelLabelWithProvider(m._uid || m.id)}</span>
                                                                                 <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${getStatusColor(modelKey)}`}></div>
                                                                             </button>
                                                                         );
@@ -30921,6 +31041,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         </div>
                                         <div className="flex items-center gap-2">
                                             <button
+                                                onClick={() => importModelLibraryEntries()}
+                                                className={`text-[10px] px-2 py-1 rounded flex items-center gap-1 ${theme === 'dark' ? 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300'}`}
+                                            >
+                                                <UploadCloud size={10} /> {t('导入模型')}
+                                            </button>
+                                            <button
                                                 onClick={() => {
                                                     if (hasExpandedLibraryModels) {
                                                         setCollapsedLibraryModels(new Set(modelLibrary.map(entry => entry.id)));
@@ -31136,6 +31262,13 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                 title={isCollapsed ? t('展开') : t('折叠')}
                                                             >
                                                                 <ChevronDown size={12} className={`transition-transform ${isCollapsed ? '' : 'rotate-180'}`} />
+                                                            </button>
+                                                            <button
+                                                                onClick={() => exportModelLibraryEntry(entry)}
+                                                                className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
+                                                                title={t('导出该模型')}
+                                                            >
+                                                                <Download size={12} />
                                                             </button>
                                                             <button
                                                                 onClick={() => setLibraryModelEditing(entry.id, !isEditing)}
