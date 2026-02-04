@@ -159,24 +159,28 @@
 > 且参数名包含 `input`（如 `seed_input` / `steps_input` / `sampler_input` / `batch_input`）。  
 > **注意**：`_input` 只是 UI 输入提示，不等于 Comfy 节点输入名。
 
-### 4.4 批量与调度参数（Batch/Sampler/Scheduler）
-模型库若需暴露更多 ComfyUI 控制能力，可用 **方式 A（直接写节点字段）** 或 **方式 B（meta.json 映射）**。
+### 4.4 参数调节指南（Seed / Sampler / Scheduler / Batch）
+参数调节的核心逻辑：**ComfyUI 只认节点输入名**，不是你自定义的参数名。
 
 **方式 A（直接写节点字段）**
 ```json
 {
   "input_values": {
     "41:EmptySD3LatentImage.batch_size": {{batch:number}},
+    "44:KSampler.seed": {{seed:number}},
+    "44:KSampler.steps": {{steps:number}},
     "44:KSampler.sampler_name": "{{sampler}}",
     "44:KSampler.scheduler": "{{scheduler}}"
   }
 }
 ```
 
-**方式 B（meta.json）**
+**方式 B（meta.json 映射）**
 ```json
 {
   "params_map": {
+    "seed": { "node_id": "44", "field": "inputs.seed" },
+    "steps": { "node_id": "44", "field": "inputs.steps" },
     "batch": { "node_id": "41", "field": "inputs.batch_size" },
     "sampler": { "node_id": "44", "field": "inputs.sampler_name" },
     "scheduler": { "node_id": "44", "field": "inputs.scheduler" }
@@ -184,9 +188,21 @@
 }
 ```
 
-* `batch`：映射到 `batch_size` 或 `sampler.batch_size`。
-* `sampler`：常见 `euler / euler_a / dpmpp_2m / dpmpp_2m_sde`。
-* `scheduler`：常见 `normal / karras / exponential`。
+**Seed（随机 / 固定）**
+1) 固定：传入具体整数。  
+2) 随机（推荐）：不传 seed 或每次传新正整数。  
+3) 本地中间件支持 `seed = -1` → 自动随机。  
+
+> ComfyUI 原生 KSampler 的 seed 最小值是 0，`-1` 并非标准随机值。  
+> **只有本地中间件才会将 `-1` 转成随机**。  
+
+**Sampler / Scheduler**
+* `sampler` 常见值：`euler / euler_a / dpmpp_2m / dpmpp_2m_sde`  
+* `scheduler` 常见值：`normal / karras / exponential`
+
+**Batch**
+* 对应节点字段通常是 `batch_size`。  
+* 如果输出仍只有 1 张，确认输出节点使用 **SaveImage**（PreviewImage 可能只返回第一张）。
 
 **提示**：在模型库自定义参数中增加 `batch_input`、`sampler_input`、`scheduler_input`，即可在 UI 显示输入框，方便用户实时调整。
 
@@ -277,55 +293,6 @@
 - **400: input type invalid**
   - 参数为空（null/空字符串）会导致 Comfy 验证失败。
   - 确保 input_values 有值，或删除该字段以使用 workflow 默认值。
-
----
-
-## 9. 参数调节指南（Seed / Sampler / Scheduler / Batch）
-
-### 9.1 种子随机（Seed）
-**推荐做法：**
-1) 在模型库中保留 `seed` 输入（如 `seed_input`）。  
-2) **要随机**时：  
-   - 可不传 `seed`（留空），让 workflow 使用自身默认值；  
-   - 或传一个新的正整数（最稳）；  
-   - 本地中间件支持 `seed = -1` → 自动随机。  
-3) **要固定**时：填一个具体整数。  
-
-> ComfyUI 的 KSampler 默认 seed 最小值是 0，`-1` 在原生 ComfyUI 并非标准随机值。  
-> **只有本地中间件才会将 `-1` 转成随机**，因此推荐在本地通过中间件调用。  
-> 若 workflow 默认 seed 是固定的（如 0），且你希望每次随机：  
-> - 加 `RandomSeed` 节点并映射；  
-> - 或在 ComfyUI 中改 seed 默认逻辑后重新导出 `template.json`。
-
-### 9.2 采样器 / 调度器切换
-在 ComfyUI 中对应输入一般是：
-- `sampler_name`
-- `scheduler`
-
-做法（任一方式）：
-1) **meta.json 映射**：  
-   - `sampler` → 对应节点的 `inputs.sampler_name`  
-   - `scheduler` → 对应节点的 `inputs.scheduler`
-2) **直接在 input_values 写 NodeID**：  
-   ```json
-   {
-     "44:KSampler.sampler_name": "{{sampler}}",
-     "44:KSampler.scheduler": "{{scheduler}}"
-   }
-   ```
-
-### 9.3 批量数量（Batch）
-ComfyUI 常见节点字段：`batch_size`
-
-做法：
-- 在 `input_values` 加：
-  ```json
-  { "41:EmptySD3LatentImage.batch_size": {{batch:number}} }
-  ```
-- 或通过 `meta.json` 把 `batch` 映射到 `inputs.batch_size`。
-
-> 如果你的 workflow 使用的是其他节点（如 EmptyLatentImage/SDXL），请以实际节点 ID 为准。
-> 若输出仍只有 1 张图，确认输出节点使用 **SaveImage**（PreviewImage 可能只返回第一张）。
 
 - **outputs/detail 404**
   - requestId 不完整（UUID 被截断）。

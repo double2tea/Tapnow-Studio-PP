@@ -85,5 +85,5 @@ curl http://127.0.0.1:9527/ping
 ```
 
 ## 关联参考
-* 本地 ComfyUI 配置请看 `localserver/Middleware_README-ComfyUI.md`，其中详细描述模板生成、meta 映射与模型库的引用章节（`model-template-readme.md` 第 4/5/9 章）。
-* 模型库设置请参考 `model-template-readme.md` 以及 `docs/api/模型库测试方法.md` 中的 Batch/Sampler/Scheduler 说明。
+* 本地 ComfyUI 配置请看 `localserver/Middleware_README-ComfyUI.md`，其中详细描述模板生成、meta 映射与模型库的引用章节（`model-template-readme.md` 第 4 章含参数调节 + 第 5 章异步）。
+* 模型库设置请参考 `model-template-readme.md` 中的 Batch/Sampler/Scheduler 说明。

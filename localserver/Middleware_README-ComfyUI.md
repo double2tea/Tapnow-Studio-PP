@@ -226,6 +226,6 @@ curl http://127.0.0.1:9527/w/v1/webapp/task/openapi/detail?requestId=<id>
 ## 5. 模型库配置引用
 本地 ComfyUI 模型推荐通过 `model-template-readme.md` 内的模型库章节配置：
 
-* 章节 4（本地 ComfyUI）详细描述 template/meta/请求模板。
-* 章节 9（参数调节）介绍 batch/sampler/scheduler 输入。
+* 章节 4（本地 ComfyUI，含参数调节）详细描述 template/meta/请求模板。
+* 章节 5（异步任务）说明轮询配置与 outputs 解析。
 * 章节 6（BizyAir）可作为参考进行对照配置。
