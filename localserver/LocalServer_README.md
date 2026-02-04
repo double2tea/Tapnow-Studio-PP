@@ -1,31 +1,67 @@
 # Tapnow Studio 本地接收器配置
 
-默认允许的根目录:
-- `~/Downloads`
-- `D:\TapnowData`
+本地接收器（LocalServer）是 Tapnow Studio 的核心基础设施，负责 **本地缓存/保存**、**跨域代理 (CORS)**、以及 **ComfyUI 中间件接入**。
 
-要自定义允许目录，请编辑同目录的 `tapnow-local-config.json`，示例:
+---
 
+## 0. 启动方式（必读）
+
+### 环境要求
+* Python 3.8+
+
+### 启动
+推荐运行全功能版本：
+```bash
+python tapnow-server-full.py
+```
+默认监听端口：**9527**
+
+---
+
+## 1. 缓存功能（主动缓存 + 保存节点）
+
+### 1.1 功能说明
+LocalServer 会在后台主动缓存所有被访问的图片/视频资源：
+* **主动缓存**：每次加载资源都会写入本地 `save_path` 并做 hash 去重。
+* **缓存优先级**：资源加载顺序为 `本地缓存 → 代理 → 直连`，确保带宽稳定与 CORS 安全。
+* **保存节点联动**：在画布启用“保存节点”后，可将输出自动落盘到本地目录，支持批量导出与复用。
+
+### 1.2 如何在画布启用
+* 在 Tapnow Studio 的 **设置面板** 启用本地缓存与保存节点。  
+* 若有“本地连接器 / 本地缓存”开关，请确保已打开。  
+
+### 1.3 更换保存目录 / 刷新缓存
+修改同目录的 `tapnow-local-config.json`：
 ```json
 {
   "allowed_roots": [
     "C:\\Users\\YourName\\Downloads",
     "D:\\TapnowData",
     "E:\\TapnowData"
-  ]
+  ],
+  "save_path": "D:\\TapnowData"
 }
 ```
+说明：
+* `save_path` 必须位于 `allowed_roots` 内，否则服务拒绝启动。
+* 修改后 **重启本地接收器**。
+* 若需要刷新缓存，可删除旧目录或更换目录后再刷新页面。
 
-说明:
-- JSON 不支持注释，路径建议使用双反斜杠或正斜杠。
-- `save_path` 必须位于 `allowed_roots` 之内，否则服务会拒绝启动。
-- 修改后需要重启本地接收器。
-- Windows 使用 `allowed_roots` 进行限制，macOS/Linux 默认仅使用 `save_path`。
+---
 
-## 代理配置（解决 CORS）
-本地接收器支持 `/proxy` 转发第三方 API 请求，适用于流式响应与上传。
+## 2. 代理功能（解决 CORS）
 
-在 `tapnow-local-config.json` 中配置 `proxy_allowed_hosts` 白名单:
+### 2.1 什么是 CORS
+浏览器出于安全限制，**禁止前端直接访问非同源 API**。  
+本地接收器通过 `/proxy` 中转，绕过浏览器跨域限制。
+
+### 2.2 代理用于谁
+* 需要浏览器跨域访问的第三方 API（如 OpenAI / Gemini / ModelScope / SiliconFlow / BizyAir）。
+* 上传/下载需要稳定 CORS 支持的图片与视频资源。
+* 需要流式响应（SSE）或大体积上传的接口调用。
+
+### 2.3 如何开启
+在 `tapnow-local-config.json` 中配置白名单并重启服务：
 
 ```json
 {
@@ -36,11 +72,8 @@
   "proxy_allowed_hosts": [
     "api.openai.com",
     "generativelanguage.googleapis.com",
-    "ai.comfly.chat",
     "api-inference.modelscope.cn",
-    "vibecodingapi.ai",
-    "yunwu.ai",
-    "muse-ai.oss-cn-hangzhou.aliyuncs.com",
+    "api.bizyair.cn",
     "googlecdn.datas.systems",
     "*.openai.azure.com"
   ],
@@ -48,8 +81,16 @@
 }
 ```
 
-使用示例:
+前端操作：
+* 在 Tapnow Studio 设置面板打开 **本地代理**（或 Proxy 开关）。
+* 如果配置了 Provider 的 Base URL，可使用 `http://127.0.0.1:9527/proxy` 作为转发入口。
 
+### 2.4 达成效果
+* 浏览器跨域限制被绕过（CORS 允许）。
+* 支持流式响应（SSE）与上传。
+* 减少前端直连失败概率。
+
+使用示例：
 ```javascript
 const target = 'https://api.openai.com/v1/chat/completions';
 const url = `http://127.0.0.1:9527/proxy?url=${encodeURIComponent(target)}`;
@@ -60,30 +101,24 @@ const resp = await fetch(url, {
 });
 ```
 
-说明:
-- `proxy_allowed_hosts` 为空则代理被禁用。
-- 如需临时允许任意域名，可设置为 `["*"]`（不建议）。
-- `proxy_timeout` 为代理超时秒数，设置为 `0` 表示不超时。
+说明：
+* `proxy_allowed_hosts` 为空则代理被禁用。
+* 如需临时允许任意域名，可设置为 `["*"]`（不建议）。
+* `proxy_timeout` 为代理超时秒数，设置为 `0` 表示不超时。
 
-## 本地缓存与保存节点
-Tapnow LocalServer 除了代理，还在后台主动缓存所有通过历史、导出、分享生成的资源。
+---
 
-* **主动缓存逻辑**：每次下载图片/视频时都会写入本地 `save_path`，并自动记录 `hash`，避免重复拉取（即使是在 ComfyUI 生成中）。
-* **保存节点联动**：在 Tapnow Studio 中启用“保存节点”，可把作业链的输出推入本地目录；本地服务会为新文件生成可浏览 URL，方便分享/批量导出。
-* **缓存优先级**：资源加载顺序为 `本地缓存 -> 代理 -> 直连`，确保 CORS 安全且带宽可控。
+## 3. 本地 ComfyUI 接入（中间件）
 
-## ComfyUI 与 CORS
-当 Tapnow Studio 需要访问本地 ComfyUI（`127.0.0.1:8188`）或其他模型服务时，LocalServer 会：
+本地 ComfyUI 中间件用于将 `127.0.0.1:8188` 封装成统一的 BizyAir 风格接口：
+* **目标**：让前端不用理解 ComfyUI 节点图，只传 prompt/seed/steps 等参数即可。
+* **收益**：统一异步轮询、统一输出解析、支持 batch 多图输出。
 
-1. 自动添加 `Access-Control-Allow-*` 头，解决浏览器跨域限制。
-2. 将请求通过 `/proxy` 中转（可配置 `proxy_allowed_hosts`）。
-3. 将生成结果写入本地缓存并返回可直接访问的 `object_url`。
+具体配置与模板生成流程请见：
+* `localserver/Middleware_README-ComfyUI.md`
 
-### Quick Test
-```bash
-curl http://127.0.0.1:9527/ping
-```
+---
 
 ## 关联参考
-* 本地 ComfyUI 配置请看 `localserver/Middleware_README-ComfyUI.md`，其中详细描述模板生成、meta 映射与模型库的引用章节（`model-template-readme.md` 第 4 章含参数调节 + 第 5 章异步）。
-* 模型库设置请参考 `model-template-readme.md` 中的 Batch/Sampler/Scheduler 说明。
+* 模型库设置请参考 `model-template-readme.md` 的第 4 章（含参数调节）与第 5 章（异步任务）。
+* ComfyUI 模板与 meta 映射流程详见 `localserver/Middleware_README-ComfyUI.md`。
