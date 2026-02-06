@@ -337,7 +337,15 @@ window.LocalImageManager = LocalImageManager;
 const normalizeDataUrl = (value) => {
     if (!value || typeof value !== 'string') return value;
     if (!value.startsWith('data:')) return value;
-    return value.replace(/\s+/g, '');
+    const cleaned = value.replace(/\s+/g, '');
+    const match = cleaned.match(/^data:([^;,]+)(;base64)?,(.*)$/i);
+    if (!match) return cleaned;
+    const mime = match[1] || 'application/octet-stream';
+    const isBase64 = !!match[2];
+    if (!isBase64) return cleaned;
+    const payload = normalizeBase64Payload(match[3] || '');
+    if (!payload) return cleaned;
+    return `data:${mime};base64,${payload}`;
 };
 
 const normalizeBase64Payload = (value) => {
@@ -1468,13 +1476,13 @@ const styles = `
         }
 
         :root {
-            --canvas-grid-color: rgba(0, 0, 0, 0.05);
+            --canvas-grid-color: #666666;
         }
         .theme-dark {
-            --canvas-grid-color: rgba(255, 255, 255, 0.06);
+            --canvas-grid-color: #bfbfbf;
         }
         .theme-solarized {
-            --canvas-grid-color: #eee8d5;
+            --canvas-grid-color: #666666;
         }
         
         /* 画布容器渲染优化 */
@@ -1482,7 +1490,7 @@ const styles = `
             transform: translateZ(0);
             backface-visibility: hidden;
             perspective: 1000px;
-            background-image: radial-gradient(var(--canvas-grid-color) 1px, transparent 1px);
+            background-image: radial-gradient(var(--canvas-grid-color) 6.0px, transparent 6.0px);
             background-size: 24px 24px;
             background-position: 0 0;
         }
@@ -1667,6 +1675,8 @@ const styles = `
 // --- 虚拟画布尺寸 ---
 const VIRTUAL_CANVAS_WIDTH = 4000;
 const VIRTUAL_CANVAS_HEIGHT = 4000;
+const IMAGE_TASK_TIMEOUT_MS = 60 * 1000;
+const VIDEO_TASK_TIMEOUT_MS = 5 * 60 * 1000;
 
 // --- 默认配置 ---
 const DEFAULT_BASE_URL = 'https://ai.comfly.chat';
@@ -1815,7 +1825,6 @@ const DELETED_MODEL_IDS = [
     'gemini-image',
     'qwen-image',
     'doubao-seedream',
-    'jimeng', // Jimeng Video
     'hailuo-02',
     'kling-v1-6',
     'wan-2.5'
@@ -1848,6 +1857,109 @@ const ASYNC_CONFIG_TEMPLATE = {
     outputsPath: 'data.outputs',
     outputsUrlField: 'object_url',
     errorPath: 'message'
+};
+
+const normalizeShotIdValue = (value) => {
+    if (value === null || value === undefined) return '';
+    return String(value).trim();
+};
+const extractShotIdMeta = (value) => {
+    const raw = normalizeShotIdValue(value);
+    if (!raw) return { raw: '', token: '', num: null, base: null };
+    const tokenMatch = raw.match(/(\d+(?:\.\d+)?)/);
+    const token = tokenMatch ? tokenMatch[1] : '';
+    let num = Number(raw);
+    if (!Number.isFinite(num) && token) {
+        num = Number(token);
+    }
+    if (!Number.isFinite(num)) num = null;
+    const base = Number.isFinite(num) ? Math.floor(num) : null;
+    return { raw, token, num, base };
+};
+const normalizeShotToken = (token) => {
+    if (!token) return '';
+    const trimmed = String(token).trim();
+    if (!trimmed) return '';
+    if (!trimmed.includes('.')) return trimmed;
+    return trimmed.replace(/\.0+$/, '').replace(/(\.\d*?[1-9])0+$/, '$1');
+};
+const isSameShotId = (a, b) => {
+    const metaA = extractShotIdMeta(a);
+    const metaB = extractShotIdMeta(b);
+    if (!metaA.raw || !metaB.raw) return false;
+    if (metaA.raw === metaB.raw) return true;
+    const tokenA = normalizeShotToken(metaA.token);
+    const tokenB = normalizeShotToken(metaB.token);
+    if (tokenA && tokenB && tokenA === tokenB) return true;
+    if (Number.isFinite(metaA.num) && Number.isFinite(metaB.num)) {
+        if (Math.abs(metaA.num - metaB.num) < 1e-3) return true;
+    }
+    return false;
+};
+const isStoryboardDebugEnabled = () => {
+    try {
+        return localStorage.getItem('tapnow_debug_storyboard') === '1';
+    } catch (e) {
+        return false;
+    }
+};
+const findStoryboardNodeById = (nodes, nodeId) => {
+    if (!Array.isArray(nodes) || !nodeId) return null;
+    const direct = nodes.find(n => n.id === nodeId);
+    if (direct) return direct;
+    const trimmed = String(nodeId).trim();
+    if (!trimmed) return null;
+    return nodes.find(n => String(n.id || '').trim() === trimmed) || null;
+};
+const resolveStoryboardShotCandidate = (node, shotId, historyItem) => {
+    const shots = node?.settings?.shots || [];
+    const direct = shots.find(s => isSameShotId(s.id, shotId));
+    if (direct) return { shot: direct, reason: 'direct' };
+    if (!historyItem) return null;
+    const prompt = (historyItem.prompt || '').trim();
+    const desc = (historyItem.description || '').trim();
+    const startTime = historyItem.startTime || historyItem.time || null;
+    let best = null;
+    let bestScore = -Infinity;
+    shots.forEach((s) => {
+        let score = 0;
+        if (prompt && s.prompt && s.prompt.trim() === prompt) score += 5;
+        if (prompt && s.description && s.description.trim() === prompt) score += 4;
+        if (desc && s.description && s.description.trim() === desc) score += 3;
+        if (startTime && s.generationStartTime) {
+            const diff = Math.abs(Number(startTime) - Number(s.generationStartTime));
+            if (Number.isFinite(diff)) {
+                if (diff < 20000) score += Math.max(0, 2 - diff / 10000);
+            }
+        }
+        if (s.status === 'generating') score += 1;
+        if (Array.isArray(s.output_images) && s.output_images.length > 0) score -= 2;
+        if (score > bestScore) {
+            bestScore = score;
+            best = s;
+        }
+    });
+    if (bestScore > 0 && best) return { shot: best, reason: 'fallback' };
+    if (shots.length === 1) return { shot: shots[0], reason: 'fallback' };
+    const generatingShots = shots.filter((s) => s.status === 'generating');
+    if (generatingShots.length === 1) return { shot: generatingShots[0], reason: 'fallback' };
+    const emptyShots = shots.filter((s) => !Array.isArray(s.output_images) || s.output_images.length === 0);
+    if (emptyShots.length === 1) return { shot: emptyShots[0], reason: 'fallback' };
+    return null;
+};
+
+const parseStoryboardSourceNodeId = (sourceNodeId) => {
+    if (!sourceNodeId || typeof sourceNodeId !== 'string') return null;
+    if (!sourceNodeId.startsWith('storyboard-') || !sourceNodeId.includes('-shot-')) return null;
+    const parts = sourceNodeId.split('-shot-');
+    if (parts.length !== 2) return null;
+    const shotId = parts[1];
+    const isImageMode = parts[0].startsWith('storyboard-img-');
+    const nodeId = isImageMode
+        ? parts[0].replace('storyboard-img-', '')
+        : parts[0].replace('storyboard-', '');
+    if (!nodeId || !shotId) return null;
+    return { nodeId, shotId, isImageMode };
 };
 const ASYNC_CONFIG_TEMPLATE_TEXT = JSON.stringify(ASYNC_CONFIG_TEMPLATE, null, 2);
 const buildEmptyAsyncConfig = () => ({
@@ -2470,6 +2582,19 @@ const extractAsyncOutputUrls = (outputs, urlField) => {
             if (trimmed) urls.push(trimmed);
         }
     };
+    const pushFromObject = (value) => {
+        if (!value || typeof value !== 'object') return;
+        if (urlField && value[urlField]) {
+            pushUrl(value[urlField]);
+            return;
+        }
+        const directUrl = value.url || value.image_url || value.imageUrl || value.object_url || value.objectUrl || value.path || value.uri || value.file_uri || value.fileUri;
+        if (directUrl) pushUrl(directUrl);
+        const base64Payload = value.b64_json || value.base64 || value.data;
+        if (typeof base64Payload === 'string' && base64Payload.trim()) {
+            pushUrl(base64Payload);
+        }
+    };
     if (Array.isArray(outputs)) {
         outputs.forEach((item) => {
             if (!item) return;
@@ -2478,23 +2603,98 @@ const extractAsyncOutputUrls = (outputs, urlField) => {
                 return;
             }
             if (typeof item === 'object') {
-                if (urlField && item[urlField]) {
-                    pushUrl(item[urlField]);
-                    return;
-                }
-                pushUrl(item.url || item.image_url || item.imageUrl || item.object_url || item.objectUrl || item.path);
+                pushFromObject(item);
             }
         });
     } else if (outputs && typeof outputs === 'object') {
-        if (urlField && outputs[urlField]) {
-            pushUrl(outputs[urlField]);
-        } else {
-            pushUrl(outputs.url || outputs.image_url || outputs.imageUrl || outputs.object_url || outputs.objectUrl || outputs.path);
-        }
+        pushFromObject(outputs);
     } else if (typeof outputs === 'string') {
         pushUrl(outputs);
     }
     return urls;
+};
+const isLikelyImagePayload = (value) => {
+    if (!value || typeof value !== 'string') return false;
+    const trimmed = value.trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('data:') || trimmed.startsWith('blob:')) return true;
+    if (LocalImageManager?.isImageId && LocalImageManager.isImageId(trimmed)) return true;
+    const base64Like = /^[A-Za-z0-9+/=_-]+$/.test(trimmed);
+    return base64Like && trimmed.length > 64;
+};
+const collectDeepImageValues = (input, maxDepth = 6) => {
+    const results = new Set();
+    const visited = new WeakSet();
+    const pushValue = (value) => {
+        if (isLikelyImagePayload(value)) results.add(value.trim());
+    };
+    const walk = (obj, depth = 0) => {
+        if (depth > maxDepth || obj === null || obj === undefined) return;
+        if (typeof obj === 'string') {
+            pushValue(obj);
+            return;
+        }
+        if (typeof obj !== 'object') return;
+        if (visited.has(obj)) return;
+        visited.add(obj);
+        const urlFields = ['url', 'image_url', 'imageUrl', 'image', 'src', 'link', 'href', 'object_url', 'objectUrl', 'path', 'uri', 'file_uri', 'fileUri', 'data', 'base64', 'b64_json'];
+        for (const field of urlFields) {
+            if (obj[field]) pushValue(obj[field]);
+        }
+        if (Array.isArray(obj)) {
+            obj.forEach((item) => walk(item, depth + 1));
+            return;
+        }
+        Object.values(obj).forEach((value) => walk(value, depth + 1));
+    };
+    walk(input, 0);
+    return Array.from(results);
+};
+const collectImmediateImageUrls = (data) => {
+    if (!data || typeof data !== 'object') return [];
+    const urls = new Set();
+    const pushUrl = (value) => {
+        if (!value) return;
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (trimmed) urls.add(trimmed);
+            return;
+        }
+        if (Array.isArray(value)) {
+            value.forEach((entry) => pushUrl(entry));
+            return;
+        }
+        if (typeof value === 'object') {
+            const directUrl = value.url || value.image_url || value.imageUrl || value.object_url || value.objectUrl || value.path || value.uri || value.file_uri || value.fileUri;
+            if (directUrl) pushUrl(directUrl);
+            const b64 = value.b64_json || value.base64 || value.data;
+            if (typeof b64 === 'string' && b64.trim()) urls.add(b64.trim());
+        }
+    };
+    const sources = [
+        data?.data?.data,
+        data?.data,
+        data?.preview,
+        data?.preview?.data,
+        data?.response,
+        data?.response?.data,
+        data?.result,
+        data?.result?.data,
+        data?.output,
+        data?.output?.data,
+        data?.images,
+        data?.data?.images,
+        data?.output_images,
+        data?.output?.output_images,
+        data?.data?.output_images,
+        data?.data?.output?.output_images,
+        data?.result?.output_images,
+        data?.result?.output?.output_images,
+        data?.output?.images,
+        data?.data?.output?.images
+    ];
+    sources.forEach((entry) => pushUrl(entry));
+    return Array.from(urls);
 };
 const resolveTemplateString = (value, vars, options = {}) => {
     if (typeof value !== 'string') return value;
@@ -3251,9 +3451,44 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
 
     // 使用ref存储最新的item值，避免闭包问题
     const itemRef = useRef(item);
+    const overlayRef = useRef(null);
+    const navGuardRef = useRef({ lastAt: 0, lastHistoryAt: 0, lastShotAt: 0, activeKey: null });
+    const onNavigateRef = useRef(onNavigate);
+    const onShotNavigateRef = useRef(onShotNavigate);
+    const onHistoryNavigateRef = useRef(onHistoryNavigate);
     useEffect(() => {
         itemRef.current = item;
     }, [item]);
+    useEffect(() => {
+        if (item) {
+            requestAnimationFrame(() => {
+                if (overlayRef.current && typeof overlayRef.current.focus === 'function') {
+                    overlayRef.current.focus();
+                }
+            });
+        } else {
+            navGuardRef.current.activeKey = null;
+        }
+    }, [!!item]);
+    useEffect(() => {
+        onNavigateRef.current = onNavigate;
+    }, [onNavigate]);
+    useEffect(() => {
+        onShotNavigateRef.current = onShotNavigate;
+    }, [onShotNavigate]);
+    useEffect(() => {
+        onHistoryNavigateRef.current = onHistoryNavigate;
+    }, [onHistoryNavigate]);
+    const normalizeNavKey = (key) => {
+        if (!key) return '';
+        const map = {
+            Left: 'ArrowLeft',
+            Right: 'ArrowRight',
+            Up: 'ArrowUp',
+            Down: 'ArrowDown'
+        };
+        return map[key] || key;
+    };
     const logLightbox = (action, detail = {}) => {
         const current = itemRef.current || item;
         console.log('[Lightbox]', action, {
@@ -3306,16 +3541,29 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
 
             // 防止在输入框中触发
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+            if (overlayRef.current && document.activeElement && !overlayRef.current.contains(document.activeElement)) {
+                return;
+            }
             if (e.repeat) return;
+            const normalizedKey = normalizeNavKey(e.key);
+            const navKeys = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'];
+            if (navKeys.includes(normalizedKey)) {
+                const guard = navGuardRef.current;
+                if (guard.activeKey && guard.activeKey === normalizedKey) return;
+                if (guard.activeKey && guard.activeKey !== normalizedKey) return;
+                guard.activeKey = normalizedKey;
+                guard.lastAt = Date.now();
+            }
 
-            if (e.key === 'ArrowLeft' || e.key === 'Left') {
+            if (normalizedKey === 'ArrowLeft') {
                 // 只在有多张图片时响应
                 if (!currentItem.mjImages || currentItem.mjImages.length <= 1) return;
                 e.preventDefault();
                 e.stopPropagation();
                 const currentIndex = currentItem.selectedMjImageIndex !== undefined ? currentItem.selectedMjImageIndex : 0;
                 const prevIndex = currentIndex > 0 ? currentIndex - 1 : currentItem.mjImages.length - 1;
-                if (prevIndex >= 0 && prevIndex < currentItem.mjImages.length && onNavigate) {
+                const handleNavigate = onNavigateRef.current;
+                if (prevIndex >= 0 && prevIndex < currentItem.mjImages.length && handleNavigate) {
                     logLightbox('navigate_left', { from: currentIndex, to: prevIndex, total: currentItem.mjImages.length });
                     // V3.7.22: 立即更新 ref，避免快速按键时状态过时
                     itemRef.current = {
@@ -3323,16 +3571,17 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
                         selectedMjImageIndex: prevIndex,
                         url: currentItem.mjImages[prevIndex]
                     };
-                    onNavigate(prevIndex);
+                    handleNavigate(prevIndex);
                 }
-            } else if (e.key === 'ArrowRight' || e.key === 'Right') {
+            } else if (normalizedKey === 'ArrowRight') {
                 // 只在有多张图片时响应
                 if (!currentItem.mjImages || currentItem.mjImages.length <= 1) return;
                 e.preventDefault();
                 e.stopPropagation();
                 const currentIndex = currentItem.selectedMjImageIndex !== undefined ? currentItem.selectedMjImageIndex : 0;
                 const nextIndex = currentIndex < currentItem.mjImages.length - 1 ? currentIndex + 1 : 0;
-                if (nextIndex >= 0 && nextIndex < currentItem.mjImages.length && onNavigate) {
+                const handleNavigate = onNavigateRef.current;
+                if (nextIndex >= 0 && nextIndex < currentItem.mjImages.length && handleNavigate) {
                     logLightbox('navigate_right', { from: currentIndex, to: nextIndex, total: currentItem.mjImages.length });
                     // V3.7.22: 立即更新 ref，避免快速按键时状态过时
                     itemRef.current = {
@@ -3340,37 +3589,53 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
                         selectedMjImageIndex: nextIndex,
                         url: currentItem.mjImages[nextIndex]
                     };
-                    onNavigate(nextIndex);
+                    handleNavigate(nextIndex);
                 }
-            } else if (e.key === 'ArrowUp' || e.key === 'Up') {
+            } else if (normalizedKey === 'ArrowUp') {
                 // V3.7.21: 上键切换到上一个镜头
                 e.preventDefault();
                 e.stopPropagation();
-                if (currentItem.storyboardContext && onShotNavigate) {
+                const guard = navGuardRef.current;
+                const now = Date.now();
+                if (now - guard.lastShotAt < 220) return;
+                guard.lastShotAt = now;
+                const handleShotNavigate = onShotNavigateRef.current;
+                if (currentItem.storyboardContext && handleShotNavigate) {
                     const { shotIndex, allShots } = currentItem.storyboardContext;
                     if (shotIndex > 0) {
                         logLightbox('shot_up', { from: shotIndex, to: shotIndex - 1, total: allShots.length });
-                        onShotNavigate(shotIndex - 1, allShots);
+                        handleShotNavigate(shotIndex - 1, allShots);
                     }
-                } else if (onHistoryNavigate) {
+                } else if (onHistoryNavigateRef.current) {
                     // V3.7.29: 历史项导航（向上 = 更早的项目）
+                    if (!currentItem?.id) return;
+                    if (now - guard.lastHistoryAt < 220) return;
+                    guard.lastHistoryAt = now;
                     logLightbox('history_up');
-                    onHistoryNavigate(-1);
+                    onHistoryNavigateRef.current(-1);
                 }
-            } else if (e.key === 'ArrowDown' || e.key === 'Down') {
+            } else if (normalizedKey === 'ArrowDown') {
                 // V3.7.21: 下键切换到下一个镜头
                 e.preventDefault();
                 e.stopPropagation();
-                if (currentItem.storyboardContext && onShotNavigate) {
+                const guard = navGuardRef.current;
+                const now = Date.now();
+                if (now - guard.lastShotAt < 220) return;
+                guard.lastShotAt = now;
+                const handleShotNavigate = onShotNavigateRef.current;
+                if (currentItem.storyboardContext && handleShotNavigate) {
                     const { shotIndex, allShots } = currentItem.storyboardContext;
                     if (shotIndex < allShots.length - 1) {
                         logLightbox('shot_down', { from: shotIndex, to: shotIndex + 1, total: allShots.length });
-                        onShotNavigate(shotIndex + 1, allShots);
+                        handleShotNavigate(shotIndex + 1, allShots);
                     }
-                } else if (onHistoryNavigate) {
+                } else if (onHistoryNavigateRef.current) {
                     // V3.7.29: 历史项导航（向下 = 更新的项目）
+                    if (!currentItem?.id) return;
+                    if (now - guard.lastHistoryAt < 220) return;
+                    guard.lastHistoryAt = now;
                     logLightbox('history_down');
-                    onHistoryNavigate(1);
+                    onHistoryNavigateRef.current(1);
                 }
             } else if (e.key === 'Escape' || e.key === 'Esc') {
                 // V3.7.28: ESC 关闭预览
@@ -3379,15 +3644,33 @@ const Lightbox = ({ item, onClose, onNavigate, onShotNavigate, onHistoryNavigate
                 handleClose('esc');
             }
         };
-
+        const handleKeyUp = (e) => {
+            const normalizedKey = normalizeNavKey(e.key);
+            const guard = navGuardRef.current;
+            if (guard.activeKey === normalizedKey) {
+                guard.activeKey = null;
+            }
+        };
         window.addEventListener('keydown', handleKeyDown);
+        window.addEventListener('keyup', handleKeyUp);
         return () => {
             window.removeEventListener('keydown', handleKeyDown);
+            window.removeEventListener('keyup', handleKeyUp);
         };
-    }, [item, onNavigate, onShotNavigate, onHistoryNavigate]);
+    }, [item]);
 
     return (
-        <div className="fixed inset-0 z-[200] lightbox-overlay flex flex-col items-center justify-center animate-in fade-in duration-200" onClick={() => handleClose('overlay')}>
+        <div
+            ref={overlayRef}
+            tabIndex={-1}
+            className="fixed inset-0 z-[200] lightbox-overlay flex flex-col items-center justify-center animate-in fade-in duration-200 focus:outline-none"
+            onClick={() => handleClose('overlay')}
+            onMouseDown={() => {
+                if (overlayRef.current && typeof overlayRef.current.focus === 'function') {
+                    overlayRef.current.focus();
+                }
+            }}
+        >
             <button className="absolute top-4 right-4 text-white/70 hover:text-white p-2 bg-black/50 rounded-full transition-colors" onClick={() => handleClose('button')}><X size={24} /></button>
             <div className="max-w-[90vw] max-h-[85vh] relative" onClick={(e) => e.stopPropagation()}>
                 {item.type === 'image' ? (
@@ -3472,12 +3755,31 @@ function TapnowApp() {
 
     // V3.7.27: Toast 通知系统
     const [toasts, setToasts] = useState([]);
+    const toastTimersRef = useRef(new Map());
     const showToast = useCallback((message, type = 'info', duration = 3000) => {
-        const id = Date.now();
+        const id = Date.now() + Math.random();
         setToasts(prev => [...prev, { id, message, type }]);
-        setTimeout(() => {
+        const timer = setTimeout(() => {
             setToasts(prev => prev.filter(t => t.id !== id));
+            toastTimersRef.current.delete(id);
         }, duration);
+        toastTimersRef.current.set(id, timer);
+        return id;
+    }, []);
+    const dismissToast = useCallback((id) => {
+        if (!id) return;
+        const timer = toastTimersRef.current.get(id);
+        if (timer) {
+            clearTimeout(timer);
+            toastTimersRef.current.delete(id);
+        }
+        setToasts(prev => prev.filter(t => t.id !== id));
+    }, []);
+    useEffect(() => {
+        return () => {
+            toastTimersRef.current.forEach((timer) => clearTimeout(timer));
+            toastTimersRef.current.clear();
+        };
     }, []);
 
     useEffect(() => {
@@ -3707,18 +4009,10 @@ function TapnowApp() {
     // V3.7.26: Strict Batch Queue Processor (Wait for batch finish + 1s delay)
     // V3.7.29: Enhanced state machine logic + Debug logging
     useEffect(() => {
-
-        if (batchQueue.length === 0) {
-            batchStateRef.current = 'idle';
-            pendingStartsRef.current.clear(); // V3.7.29: 清理挂起任务
-            return;
-        }
-
         // 1. Calculate current active shots
         let currentGeneratingCount = 0;
         const stuckTasks = []; // V3.7.27: 检测卡住的任务
         const now = Date.now();
-        const TASK_TIMEOUT_MS = 60000; // 60秒超时
 
         nodes.forEach(n => {
             if (n.settings?.shots) {
@@ -3726,8 +4020,10 @@ function TapnowApp() {
                     if (s.status === 'generating') {
                         currentGeneratingCount++;
                         // V3.7.27: 检测超时任务
-                        if (s.generationStartTime && (now - s.generationStartTime) > TASK_TIMEOUT_MS) {
-                            stuckTasks.push({ nodeId: n.id, shotId: s.id });
+                        const mode = n.settings?.mode || 'video';
+                        const taskTimeoutMs = mode === 'image' ? IMAGE_TASK_TIMEOUT_MS : VIDEO_TASK_TIMEOUT_MS;
+                        if (s.generationStartTime && (now - s.generationStartTime) > taskTimeoutMs) {
+                            stuckTasks.push({ nodeId: n.id, shotId: s.id, timeoutMs: taskTimeoutMs });
                         }
                     }
                     // Cleanup pending starts
@@ -3743,16 +4039,25 @@ function TapnowApp() {
 
         // V3.7.27: 自动标记超时任务为 failed，防止队列阻塞
         if (stuckTasks.length > 0) {
-            console.warn(`[Batch] ${stuckTasks.length} tasks timed out (>${TASK_TIMEOUT_MS / 1000}s). Auto-marking as failed.`);
-            stuckTasks.forEach(({ nodeId, shotId }) => {
+            console.warn(`[Batch] ${stuckTasks.length} tasks timed out (image>${IMAGE_TASK_TIMEOUT_MS / 1000}s, video>${VIDEO_TASK_TIMEOUT_MS / 1000}s). Auto-marking as failed.`);
+            stuckTasks.forEach(({ nodeId, shotId, timeoutMs }) => {
+                const timeoutSeconds = Math.round((timeoutMs || IMAGE_TASK_TIMEOUT_MS) / 1000);
                 // V3.7.29: 使用条件更新，防止覆盖已完成的状态
-                updateShot(nodeId, shotId, { status: 'failed', errorMsg: '任务超时（60s）' }, { onlyIfStatus: 'generating' });
+                updateShot(nodeId, shotId, { status: 'failed', errorMsg: `任务超时（${timeoutSeconds}s）` }, { onlyIfStatus: 'generating' });
             });
             currentGeneratingCount -= stuckTasks.length;
         }
 
         // Add pending starts (tasks initiated but not yet generating)
         const totalActive = currentGeneratingCount + pendingStartsRef.current.size;
+
+        if (batchQueue.length === 0) {
+            if (totalActive === 0) {
+                batchStateRef.current = 'idle';
+                pendingStartsRef.current.clear(); // V3.7.29: 清理挂起任务
+            }
+            return;
+        }
 
         // 2. State Machine Logic
         if (totalActive > 0) {
@@ -3794,7 +4099,7 @@ function TapnowApp() {
 
                 // Find correct shot object
                 const currentNode = nodes.find(n => n.id === item.nodeId);
-                const currentShot = currentNode?.settings?.shots?.find(s => s.id === item.shotId);
+                const currentShot = currentNode?.settings?.shots?.find(s => isSameShotId(s.id, item.shotId));
 
                 if (currentShot) {
                     if (item.mode === 'image') {
@@ -3809,12 +4114,14 @@ function TapnowApp() {
 
     // V3.7.27: 周期性触发队列检查，防止因状态更新遗漏导致的阻塞
     useEffect(() => {
-        if (batchQueue.length === 0) return;
+        const hasGenerating = nodes.some(n => (n.settings?.shots || []).some(s => s.status === 'generating'));
+        const hasPendingStarts = pendingStartsRef.current.size > 0;
+        if (batchQueue.length === 0 && !hasGenerating && !hasPendingStarts) return;
         const interval = setInterval(() => {
             setBatchTick(t => t + 1);
         }, 5000); // 每5秒检查一次
         return () => clearInterval(interval);
-    }, [batchQueue.length > 0]);
+    }, [batchQueue.length, nodes]);
 
     const clearBatchQueue = useCallback((stopRunning = false) => {
         setBatchQueue([]);
@@ -4414,6 +4721,25 @@ function TapnowApp() {
             return true;
         }
     });
+    const HISTORY_SAVE_LIMIT_MIN = 20;
+    const HISTORY_SAVE_LIMIT_MAX = 160;
+    const normalizeHistorySaveLimit = (value) => {
+        const parsed = Number.parseInt(value, 10);
+        const safe = Number.isFinite(parsed) ? parsed : 80;
+        return Math.min(HISTORY_SAVE_LIMIT_MAX, Math.max(HISTORY_SAVE_LIMIT_MIN, safe));
+    };
+    const [historySaveLimit, setHistorySaveLimit] = useState(() => {
+        try {
+            const saved = localStorage.getItem('tapnow_history_limit');
+            if (saved === null) return 80;
+            return normalizeHistorySaveLimit(saved);
+        } catch (e) {
+            return 80;
+        }
+    });
+    const [historySaveLimitInput, setHistorySaveLimitInput] = useState(() => String(historySaveLimit));
+    const historySaveLimitTimerRef = useRef(null);
+    const historySaveLimitErrorRef = useRef({ lastValue: null, toastId: null });
     const [cacheRefreshTick, setCacheRefreshTick] = useState(0);
     const [localCacheBannerVisible, setLocalCacheBannerVisible] = useState(false);
     const localCacheBannerTimerRef = useRef(null);
@@ -4631,6 +4957,54 @@ function TapnowApp() {
     useEffect(() => {
         localStorage.setItem('tapnow_save_history_assets', String(saveHistoryAssets));
     }, [saveHistoryAssets]);
+    useEffect(() => {
+        try {
+            localStorage.setItem('tapnow_history_limit', String(historySaveLimit));
+        } catch (e) { }
+    }, [historySaveLimit]);
+
+    useEffect(() => {
+        setHistorySaveLimitInput(String(historySaveLimit));
+    }, [historySaveLimit]);
+
+    const applyHistorySaveLimitInput = useCallback((rawValue) => {
+        const trimmed = String(rawValue ?? '').trim();
+        if (!trimmed) {
+            if (historySaveLimitErrorRef.current.toastId) {
+                dismissToast(historySaveLimitErrorRef.current.toastId);
+                historySaveLimitErrorRef.current.toastId = null;
+                historySaveLimitErrorRef.current.lastValue = null;
+            }
+            return;
+        }
+        const parsed = Number.parseInt(trimmed, 10);
+        if (!Number.isFinite(parsed)) return;
+        if (parsed < HISTORY_SAVE_LIMIT_MIN || parsed > HISTORY_SAVE_LIMIT_MAX) {
+            if (historySaveLimitErrorRef.current.lastValue !== trimmed) {
+                historySaveLimitErrorRef.current.lastValue = trimmed;
+                if (historySaveLimitErrorRef.current.toastId) {
+                    dismissToast(historySaveLimitErrorRef.current.toastId);
+                }
+                historySaveLimitErrorRef.current.toastId = showToast(`${t('历史保存上限需在')} ${HISTORY_SAVE_LIMIT_MIN}-${HISTORY_SAVE_LIMIT_MAX} ${t('之间')}`, 'error', 300000);
+            }
+            return;
+        }
+        if (historySaveLimitErrorRef.current.toastId) {
+            dismissToast(historySaveLimitErrorRef.current.toastId);
+            historySaveLimitErrorRef.current.toastId = null;
+        }
+        historySaveLimitErrorRef.current.lastValue = null;
+        setHistorySaveLimit(parsed);
+        setHistorySaveLimitInput(String(parsed));
+    }, [HISTORY_SAVE_LIMIT_MIN, HISTORY_SAVE_LIMIT_MAX, showToast, dismissToast, t]);
+    useEffect(() => {
+        return () => {
+            if (historySaveLimitTimerRef.current) {
+                clearTimeout(historySaveLimitTimerRef.current);
+                historySaveLimitTimerRef.current = null;
+            }
+        };
+    }, []);
 
     useEffect(() => {
         localStorage.setItem('tapnow_global_performance_mode', globalPerformanceMode);
@@ -4763,8 +5137,49 @@ function TapnowApp() {
     const [sessionStartTime] = useState(() => Date.now());
     // V3.4.12: 下载进度状态
     const [downloadProgress, setDownloadProgress] = useState({ active: false, current: 0, total: 0, filename: '' });
+    const [downloadDisplay, setDownloadDisplay] = useState({ visible: false, current: 0, total: 0 });
+    const downloadDisplayRef = useRef({ lastCurrent: 0, lastTotal: 0, holdUntil: 0, wasActive: false, timer: null });
     // V3.4.12: 历史记录选择状态
     const [historySelection, setHistorySelection] = useState(new Set());
+    useEffect(() => {
+        const now = Date.now();
+        const ref = downloadDisplayRef.current;
+        if (downloadProgress.total > 0) {
+            ref.lastCurrent = downloadProgress.current;
+            ref.lastTotal = downloadProgress.total;
+        }
+        if (downloadProgress.active) {
+            if (ref.timer) {
+                clearTimeout(ref.timer);
+                ref.timer = null;
+            }
+            ref.holdUntil = 0;
+            setDownloadDisplay({ visible: true, current: downloadProgress.current, total: downloadProgress.total });
+        } else {
+            if (ref.wasActive && ref.lastTotal > 0) {
+                ref.holdUntil = now + 10000;
+                if (ref.timer) clearTimeout(ref.timer);
+                ref.timer = setTimeout(() => {
+                    setDownloadDisplay((prev) => ({ ...prev, visible: false }));
+                    downloadDisplayRef.current.timer = null;
+                }, 10000);
+                setDownloadDisplay({ visible: true, current: ref.lastCurrent, total: ref.lastTotal });
+            } else if (ref.holdUntil > now) {
+                setDownloadDisplay({ visible: true, current: ref.lastCurrent, total: ref.lastTotal });
+            } else {
+                setDownloadDisplay((prev) => (prev.visible ? { ...prev, visible: false } : prev));
+            }
+        }
+        ref.wasActive = downloadProgress.active;
+    }, [downloadProgress]);
+    useEffect(() => {
+        return () => {
+            if (downloadDisplayRef.current.timer) {
+                clearTimeout(downloadDisplayRef.current.timer);
+                downloadDisplayRef.current.timer = null;
+            }
+        };
+    }, []);
     // V3.4.12: 自动保存配置
     const [autoSaveConfig, setAutoSaveConfig] = useState(() => {
         try {
@@ -4807,6 +5222,8 @@ function TapnowApp() {
     // V3.7.22: Ref 用于解决 onNavigate 闭包过时问题
     const lightboxItemRef = useRef(lightboxItem);
     useEffect(() => { lightboxItemRef.current = lightboxItem; }, [lightboxItem]);
+    const lightboxHistorySnapshotRef = useRef(null); // 保存打开时的历史顺序，避免滚动/新增导致跳序
+    const lightboxHistoryIndexRef = useRef(-1);
     const [promptLibrary, setPromptLibrary] = useState(() => {
         try {
             const saved = localStorage.getItem(PROMPT_LIBRARY_KEY);
@@ -5141,6 +5558,51 @@ function TapnowApp() {
         if (trimmed.startsWith('UklGR') && trimmed.toUpperCase().includes('WEBP')) return 'image/webp';
         return fallback;
     }, []);
+
+    const normalizeImageUrlValue = (value, mimeHint = 'image/png') => {
+        if (!value || typeof value !== 'string') return '';
+        const trimmed = value.trim();
+        if (!trimmed) return '';
+        if (trimmed.startsWith('data:')) return normalizeDataUrl(trimmed);
+        if (trimmed.startsWith('blob:') || trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
+        if (LocalImageManager.isImageId(trimmed) || trimmed.startsWith('asset://')) return trimmed;
+        const base64Like = /^[A-Za-z0-9+/=_-]+$/.test(trimmed);
+        if (base64Like && trimmed.length > 64) {
+            const mimeType = detectBase64ImageMime(trimmed, mimeHint);
+            const normalized = normalizeBase64Payload(trimmed);
+            if (!normalized) return '';
+            return `data:${mimeType};base64,${normalized}`;
+        }
+        return trimmed;
+    };
+
+    const persistBase64ImageUrl = async (value, options = {}) => {
+        if (!value || typeof value !== 'string' || !value.startsWith('data:')) return value;
+        if (options.persistBase64 === false) return value;
+        if (!LocalImageManager?.saveImage) return value;
+        const minLength = Number.isFinite(options.minLength) ? options.minLength : 2000;
+        if (value.length < minLength) return value;
+        try {
+            const imgId = await LocalImageManager.saveImage(value);
+            return imgId || value;
+        } catch (e) {
+            return value;
+        }
+    };
+
+    const normalizeImageUrls = async (urls, options = {}) => {
+        if (!Array.isArray(urls)) return [];
+        const normalized = urls
+            .map((url) => normalizeImageUrlValue(url, options.mimeHint || 'image/png'))
+            .filter(Boolean);
+        const unique = [];
+        normalized.forEach((url) => {
+            if (!unique.includes(url)) unique.push(url);
+        });
+        if (options.persistBase64 === false) return unique;
+        const persisted = await Promise.all(unique.map((url) => persistBase64ImageUrl(url, options)));
+        return persisted.filter(Boolean);
+    };
 
     const getUrlExt = useCallback((url, fallback = '') => {
         if (!url) return fallback;
@@ -5568,7 +6030,7 @@ function TapnowApp() {
                 }
             }
         } catch (e) {
-            if (imageUrl && !imageUrl.startsWith('data:') && !useProxy) {
+            if (imageUrl && !imageUrl.startsWith('data:')) {
                 recordCacheFetchFailure(imageUrl);
             }
             console.warn('[缓存] 保存图片缓存失败:', e);
@@ -5611,7 +6073,7 @@ function TapnowApp() {
                 }
             }
         } catch (e) {
-            if (!useProxy) {
+            if (videoUrl) {
                 recordCacheFetchFailure(videoUrl);
             }
             console.warn('[缓存] 保存视频缓存失败:', e);
@@ -5873,11 +6335,27 @@ function TapnowApp() {
             }
             const normalized = sanitizeHistoryUrlValue(specificUrl, '', { allowLocalCache: localCacheActive });
             if (!normalized || normalized.startsWith('blob:')) {
-                const fallback = getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive });
+                const fallback = sanitizeHistoryUrlValue(
+                    getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive }),
+                    '',
+                    { allowLocalCache: localCacheActive }
+                );
+                return normalizeHistoryUrl(fallback || '');
+            }
+            if (!localCacheActive && normalized.startsWith('data:')) {
+                const fallback = sanitizeHistoryUrlValue(
+                    getHistoryFallbackUrl(item, { allowLocalCache: false }),
+                    '',
+                    { allowLocalCache: false }
+                );
                 return normalizeHistoryUrl(fallback || '');
             }
             if (!localCacheActive && isLocalCacheUrl(normalized)) {
-                const fallback = getHistoryFallbackUrl(item, { allowLocalCache: false });
+                const fallback = sanitizeHistoryUrlValue(
+                    getHistoryFallbackUrl(item, { allowLocalCache: false }),
+                    '',
+                    { allowLocalCache: false }
+                );
                 return normalizeHistoryUrl(fallback || '');
             }
             if (localCacheActive && isComfyLocalUrl(normalized)) {
@@ -5892,7 +6370,11 @@ function TapnowApp() {
         if (cacheUrl && isLocalCacheUrlAvailable(cacheUrl)) {
             return normalizeHistoryUrl(cacheUrl);
         }
-        const fallback = getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive });
+        const fallback = sanitizeHistoryUrlValue(
+            getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive }),
+            '',
+            { allowLocalCache: localCacheActive }
+        );
         return normalizeHistoryUrl(fallback || '');
     }, [localCacheActive, historyLocalCacheMap, isLocalCacheUrlAvailable, localCacheIndexTick, sanitizeHistoryUrlValue, getHistoryFallbackUrl, isLocalCacheUrl, isComfyLocalUrl, localServerUrl]);
 
@@ -5917,12 +6399,17 @@ function TapnowApp() {
             if (!normalized || normalized.startsWith('blob:')) {
                 const fallback = getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive })
                     || sanitizeHistoryUrlValue(item.thumbnailUrl, '', { allowLocalCache: localCacheActive });
-                return normalizeHistoryUrl(fallback || '');
+                return normalizeHistoryUrl(sanitizeHistoryUrlValue(fallback || '', '', { allowLocalCache: localCacheActive }) || '');
+            }
+            if (!localCacheActive && normalized.startsWith('data:')) {
+                const fallback = getHistoryFallbackUrl(item, { allowLocalCache: false })
+                    || sanitizeHistoryUrlValue(item.thumbnailUrl, '', { allowLocalCache: false });
+                return normalizeHistoryUrl(sanitizeHistoryUrlValue(fallback || '', '', { allowLocalCache: false }) || '');
             }
             if (!localCacheActive && isLocalCacheUrl(normalized)) {
                 const fallback = getHistoryFallbackUrl(item, { allowLocalCache: false })
                     || sanitizeHistoryUrlValue(item.thumbnailUrl, '', { allowLocalCache: false });
-                return normalizeHistoryUrl(fallback || '');
+                return normalizeHistoryUrl(sanitizeHistoryUrlValue(fallback || '', '', { allowLocalCache: false }) || '');
             }
             if (localCacheActive && isComfyLocalUrl(normalized)) {
                 const base = (localServerUrl || '').trim().replace(/\/+$/, '');
@@ -5945,7 +6432,7 @@ function TapnowApp() {
         }
         const fallback = sanitizeHistoryUrlValue(item.thumbnailUrl, '', { allowLocalCache: localCacheActive })
             || getHistoryFallbackUrl(item, { allowLocalCache: localCacheActive });
-        return normalizeHistoryUrl(fallback || '');
+        return normalizeHistoryUrl(sanitizeHistoryUrlValue(fallback || '', '', { allowLocalCache: localCacheActive }) || '');
     }, [localCacheActive, performanceMode, historyLocalCacheMap, isLocalCacheUrlAvailable, localCacheIndexTick, sanitizeHistoryUrlValue, getHistoryFallbackUrl, isLocalCacheUrl, isComfyLocalUrl, localServerUrl]);
 
     const getHistoryMultiImages = useCallback((item) => {
@@ -5954,6 +6441,18 @@ function TapnowApp() {
         if (Array.isArray(item.output_images) && item.output_images.length > 1) return item.output_images;
         return null;
     }, []);
+    const getHistoryNavPreview = useCallback((item) => {
+        if (!item) return { url: '', index: 0 };
+        const multiImages = getHistoryMultiImages(item);
+        const maxIndex = multiImages ? multiImages.length - 1 : 0;
+        const rawIndex = Number.isInteger(item.selectedMjImageIndex) ? item.selectedMjImageIndex : 0;
+        const index = Math.max(0, Math.min(rawIndex, maxIndex));
+        const selectedUrl = multiImages ? multiImages[index] : null;
+        const resolvedUrl = selectedUrl
+            ? resolveHistoryUrl(item, selectedUrl)
+            : resolveHistoryUrl(item);
+        return { url: resolvedUrl || '', index };
+    }, [getHistoryMultiImages, resolveHistoryUrl]);
 
     const rebuildHistoryThumbnail = useCallback(async (item, options = {}) => {
         if (!item) return;
@@ -6549,8 +7048,9 @@ function TapnowApp() {
         if (!item) return false;
         const status = item?.status;
         if (status && !['completed', 'complete', 'success', 'done'].includes(status)) return false;
-        return true;
-    }, []);
+        const preview = getHistoryNavPreview(item);
+        return !!preview?.url;
+    }, [getHistoryNavPreview]);
     const historyNavItems = useMemo(
         () => historyDisplayItems.filter(isHistoryItemNavigable),
         [historyDisplayItems, isHistoryItemNavigable]
@@ -6570,6 +7070,27 @@ function TapnowApp() {
             if (isHistoryItemNavigable(candidate)) return idx;
         }
     }, [isHistoryItemNavigable]);
+
+    useEffect(() => {
+        const current = lightboxItemRef.current;
+        if (!current || current.storyboardContext) {
+            lightboxHistorySnapshotRef.current = null;
+            lightboxHistoryIndexRef.current = -1;
+            return;
+        }
+        if (!lightboxHistorySnapshotRef.current) {
+            const validIds = historyNavItems
+                .filter(item => !!getHistoryNavPreview(item).url)
+                .map(item => item.id);
+            if (current.id && !validIds.includes(current.id)) {
+                validIds.unshift(current.id);
+            }
+            lightboxHistorySnapshotRef.current = validIds;
+        }
+        if (lightboxHistorySnapshotRef.current) {
+            lightboxHistoryIndexRef.current = lightboxHistorySnapshotRef.current.indexOf(current.id);
+        }
+    }, [lightboxItem?.id, lightboxItem?.storyboardContext, historyNavItems, getHistoryNavPreview]);
 
     // 当视频 URL 改变时清除错误提示
     useEffect(() => {
@@ -6655,11 +7176,43 @@ function TapnowApp() {
         setHistoryFocusId(historyNavItems[0]?.id || null);
     }, [historyOpen, historyNavItems, historyFocusId, historyFocusIndex, getHistoryNavIndexById]);
 
-    const MAX_HISTORY_LOCAL_STORAGE = 80;
+    const historyLimit = normalizeHistorySaveLimit(historySaveLimit);
+    const historyLimitWarningRef = useRef({ initialized: false, lastCount: 0, lastLimit: historyLimit, toastId: null });
+
+    useEffect(() => {
+        const limit = historyLimit;
+        const count = history.length;
+        const ref = historyLimitWarningRef.current;
+        if (!ref.initialized) {
+            ref.initialized = true;
+            ref.lastCount = count;
+            ref.lastLimit = limit;
+            return;
+        }
+        if (!limit || limit <= 0) {
+            ref.lastCount = count;
+            ref.lastLimit = limit;
+            return;
+        }
+        const threshold = Math.max(1, Math.ceil(limit * 0.9));
+        const crossed = ref.lastCount < threshold && count >= threshold;
+        const limitChanged = ref.lastLimit !== limit;
+        if ((crossed || limitChanged) && count >= threshold) {
+            if (!ref.toastId) {
+                ref.toastId = showToast(`${t('历史数量已接近上限')} (${count}/${limit})，${t('建议保存资产包或清理历史')}`, 'warning', 300000);
+            }
+        }
+        if (count < threshold && ref.toastId) {
+            dismissToast(ref.toastId);
+            ref.toastId = null;
+        }
+        ref.lastCount = count;
+        ref.lastLimit = limit;
+    }, [history.length, historyLimit, showToast, dismissToast, t]);
 
     const trimHistoryUrlForStorage = (url) => {
         if (!url) return url;
-        if (url.startsWith('data:') && url.length > 5000) return `${url.substring(0, 100)}...`;
+        if (url.startsWith('data:') && url.length > 5000) return '';
         return url;
     };
     const compactCacheMapForStorage = (cacheMap, limit = 8) => {
@@ -6768,7 +7321,7 @@ function TapnowApp() {
     const persistHistorySnapshot = (historyItems = []) => {
         try {
             const historyToSave = historyItems
-                .slice(0, MAX_HISTORY_LOCAL_STORAGE)
+                .slice(0, historyLimit)
                 .map((item) => compactHistoryItemForStorage(item));
             localStorage.setItem('tapnow_history', JSON.stringify(historyToSave));
             return true;
@@ -6812,7 +7365,7 @@ function TapnowApp() {
         try {
             // 只存储必要的元数据，不存储完整的base64图片和长URL
             const historyToSave = history
-                .slice(0, MAX_HISTORY_LOCAL_STORAGE)
+                .slice(0, historyLimit)
                 .map((item) => {
                     const saved = compactHistoryItemForStorage(item);
                     // V3.4.10: 只对 Midjourney 切割图片清空 mjImages，保留 Jimeng 等其他模型的多图
@@ -7177,7 +7730,13 @@ function TapnowApp() {
         if (!customParams.length) return null;
         const values = currentValues || {};
         return (
-            <div className="flex flex-col gap-2">
+            <div
+                className="flex flex-col gap-2"
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
+                onTouchStart={(e) => e.stopPropagation()}
+            >
                 <div className={`text-[10px] font-medium ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('自定义参数')}</div>
                 {customParams.map((param) => {
                     const paramId = param.id || param.name;
@@ -7216,6 +7775,9 @@ function TapnowApp() {
                                             : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
                                             }`}
                                         onMouseDown={(e) => e.stopPropagation()}
+                                        onClick={(e) => e.stopPropagation()}
+                                        onPointerDown={(e) => e.stopPropagation()}
+                                        onTouchStart={(e) => e.stopPropagation()}
                                     />
                                     {filteredOptions.length > 0 && (
                                         <datalist id={`param-suggest-${paramId}`}>
@@ -7243,6 +7805,9 @@ function TapnowApp() {
                                         : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800' : 'bg-white border-zinc-300 text-zinc-800'
                                         }`}
                                     onMouseDown={(e) => e.stopPropagation()}
+                                    onClick={(e) => e.stopPropagation()}
+                                    onPointerDown={(e) => e.stopPropagation()}
+                                    onTouchStart={(e) => e.stopPropagation()}
                                 >
                                     <option value="">{t('不设置')}</option>
                                     {options.map(option => (
@@ -7269,6 +7834,9 @@ function TapnowApp() {
                                         : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5] text-zinc-800 placeholder-zinc-400' : 'bg-white border-zinc-300 text-zinc-800 placeholder-zinc-400'
                                         }`}
                                     onMouseDown={(e) => e.stopPropagation()}
+                                    onClick={(e) => e.stopPropagation()}
+                                    onPointerDown={(e) => e.stopPropagation()}
+                                    onTouchStart={(e) => e.stopPropagation()}
                                 />
                             )}
                             {param.override && (
@@ -11579,6 +12147,16 @@ function TapnowApp() {
         // banana模型使用800秒超时（160次 * 5秒），其他模型使用25分钟（300次 * 5秒）
         const maxAttempts = isBananaModel ? 160 : 300;
         const baseDelayMs = 5000; // 基础轮询间隔5秒
+        const delayMs = baseDelayMs;
+        const isLikelyImageValue = (value) => {
+            if (!value || typeof value !== 'string') return false;
+            const trimmed = value.trim();
+            if (!trimmed) return false;
+            if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('data:')) return true;
+            if (LocalImageManager?.isImageId && LocalImageManager.isImageId(trimmed)) return true;
+            const base64Like = /^[A-Za-z0-9+/=_-]+$/.test(trimmed);
+            return base64Like && trimmed.length > 64;
+        };
 
         if (attempt > maxAttempts) {
             const timeoutSeconds = isBananaModel ? 800 : 1500;
@@ -11600,8 +12178,27 @@ function TapnowApp() {
                 'Content-Type': 'application/json'
             },
         })
-            .then((resp) => resp.text())
-            .then((text) => {
+            .then(async (resp) => {
+                if (resp.status === 401 || resp.status === 402 || resp.status === 403) {
+                    const reason = resp.status === 402 ? '积分耗尽 (402)' : (resp.status === 401 ? '认证失效 (401)' : '访问被拒绝 (403)');
+                    setHistory((prev) => prev.map((hItem) => {
+                        if (hItem.id !== taskId) return hItem;
+                        const durationMs = Date.now() - (hItem.startTime || Date.now());
+                        const errorMsg = `图像轮询失败: ${reason}`;
+                        const storyboardTask = storyboardTaskMapRef.current.get(taskId) || parseStoryboardSourceNodeId(hItem.sourceNodeId || sourceNodeId);
+                        if (storyboardTask?.isImageMode) {
+                            updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
+                                status: 'failed',
+                                errorMsg,
+                                durationCost: durationMs / 1000
+                            });
+                            storyboardTaskMapRef.current.delete(taskId);
+                        }
+                        return { ...hItem, status: 'failed', errorMsg };
+                    }));
+                    return;
+                }
+                const text = await resp.text();
                 let data;
                 try {
                     data = JSON.parse(text);
@@ -11687,7 +12284,7 @@ function TapnowApp() {
                             // 优先检查当前对象的常见字段（避免不必要的递归）
                             const urlFields = ['url', 'image_url', 'imageUrl', 'image', 'src', 'link', 'href'];
                             for (const field of urlFields) {
-                                if (obj[field] && typeof obj[field] === 'string' && obj[field].startsWith('http')) {
+                                if (isLikelyImageValue(obj[field])) {
                                     return obj[field];
                                 }
                             }
@@ -11719,292 +12316,234 @@ function TapnowApp() {
                 }
 
                 const errorMsg = data?.message || data?.error || data?.fail_reason || '';
+                const completedStatuses = new Set(['COMPLETED', 'SUCCESS', 'FINISHED', 'DONE']);
+                const failedStatuses = new Set(['FAILED', 'ERROR', 'CANCELLED', 'FAILURE']);
+                const isCompletedStatus = completedStatuses.has(status);
+                const isFailedStatus = failedStatuses.has(status);
+                let rawImageUrls = [];
+                let resolvedImageUrls = [];
+                if (isCompletedStatus && images && images.length > 0) {
+                    rawImageUrls = images.flatMap((img) => {
+                        if (!img) return [];
+                        if (typeof img === 'string') return [img];
+                        const candidates = [
+                            img.url,
+                            img.image_url,
+                            img.imageUrl,
+                            img.object_url,
+                            img.objectUrl,
+                            img.path,
+                            img.uri,
+                            img.file_uri,
+                            img.fileUri,
+                            img.b64_json,
+                            img.base64,
+                            img.data
+                        ];
+                        return candidates.filter(Boolean);
+                    });
+                    if (rawImageUrls.length > 0) {
+                        try {
+                            resolvedImageUrls = await normalizeImageUrls(rawImageUrls);
+                        } catch (e) {
+                            resolvedImageUrls = [];
+                        }
+                        if (resolvedImageUrls.length === 0) resolvedImageUrls = rawImageUrls;
+                    }
+                }
 
                 // 更新历史记录
                 setHistory((prev) => {
                     const updated = prev.map((hItem) => {
-                        if (hItem.id === taskId) {
-                            // 支持多种成功状态值
-                            if (status === 'COMPLETED' || status === 'SUCCESS' || status === 'FINISHED' || status === 'DONE') {
+                        if (hItem.id !== taskId) return hItem;
 
-                                // 保存sourceNodeId，用于后续更新预览窗口
-                                const savedSourceNodeId = hItem.sourceNodeId || sourceNodeId;
+                        // 保存sourceNodeId，用于后续更新预览窗口
+                        const savedSourceNodeId = hItem.sourceNodeId || sourceNodeId;
 
-                                // 任务完成
-                                if (images && images.length > 0) {
-                                    // 提取图片URL，支持多种字段名和格式
-                                    const imageUrls = images.map(img => {
-                                        if (typeof img === 'string') return img;
-                                        return img?.url || img?.image_url || img?.imageUrl || '';
-                                    }).filter(Boolean);
+                        // 支持多种成功状态值
+                        if (isCompletedStatus) {
+                            if (resolvedImageUrls.length > 0) {
+                                const primaryUrl = resolvedImageUrls[0];
 
+                                // 优先使用后端返回的实际花费时间（如果存在）
+                                // 后端可能返回的字段：duration, cost_time, elapsed_time, time_cost, spent_time 等（单位可能是秒或毫秒）
+                                let durationMs = null;
+                                const backendDuration = data?.data?.duration || data?.data?.cost_time || data?.data?.elapsed_time ||
+                                    data?.data?.time_cost || data?.data?.spent_time || data?.duration ||
+                                    data?.cost_time || data?.elapsed_time || data?.time_cost || data?.spent_time;
 
-                                    if (imageUrls.length > 0) {
-                                        const primaryUrl = imageUrls[0];
-
-                                        // V3.6.1: 检查是否是分镜表的图片任务
-                                        if (storyboardTaskMapRef.current.has(taskId)) {
-                                            const storyboardTask = storyboardTaskMapRef.current.get(taskId);
-
-
-                                            if (storyboardTask && storyboardTask.isImageMode) {
-                                                // V3.7.29: 传递所有图片，与同步生成保持一致
-                                                updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
-                                                    output_images: imageUrls, // V3.7.29: 所有图片
-                                                    output_url: primaryUrl,   // 兼容旧逻辑
-                                                    selectedImageIndex: 0,    // 默认选中第一张
-                                                    outputEnabled: false,     // 用户手动选择满意的
-                                                    status: 'done',
-                                                    durationCost: durationMs ? durationMs / 1000 : 0 // Save duration in seconds
-                                                });
-                                                // 清理任务映射
-                                                storyboardTaskMapRef.current.delete(taskId);
-                                            } else {
-                                                console.warn('[V3.7.30 Async Debug] 分镜表任务未找到或不是图片模式，无法回填');
-                                            }
-                                        } // Close if (storyboardTaskMapRef.current.has(taskId))
-
-                                        // 优先使用后端返回的实际花费时间（如果存在）
-                                        // 后端可能返回的字段：duration, cost_time, elapsed_time, time_cost, spent_time 等（单位可能是秒或毫秒）
-                                        let durationMs = null;
-                                        const backendDuration = data?.data?.duration || data?.data?.cost_time || data?.data?.elapsed_time ||
-                                            data?.data?.time_cost || data?.data?.spent_time || data?.duration ||
-                                            data?.cost_time || data?.elapsed_time || data?.time_cost || data?.spent_time;
-
-                                        if (backendDuration !== null && backendDuration !== undefined) {
-                                            // 如果后端返回的是秒（数字<10000），转换为毫秒；否则认为是毫秒
-                                            if (typeof backendDuration === 'number') {
-                                                durationMs = backendDuration < 10000 ? backendDuration * 1000 : backendDuration;
-                                            } else if (typeof backendDuration === 'string') {
-                                                // 尝试解析字符串格式的时间（如 "49.0s", "107.0s"）
-                                                const match = backendDuration.match(/(\d+\.?\d*)\s*(s|ms|秒|毫秒)/i);
-                                                if (match) {
-                                                    const value = parseFloat(match[1]);
-                                                    const unit = match[2].toLowerCase();
-                                                    durationMs = (unit === 's' || unit === '秒') ? value * 1000 : value;
-                                                } else {
-                                                    const parsed = parseFloat(backendDuration);
-                                                    if (!isNaN(parsed)) {
-                                                        durationMs = parsed < 10000 ? parsed * 1000 : parsed;
-                                                    }
-                                                }
+                                if (backendDuration !== null && backendDuration !== undefined) {
+                                    // 如果后端返回的是秒（数字<10000），转换为毫秒；否则认为是毫秒
+                                    if (typeof backendDuration === 'number') {
+                                        durationMs = backendDuration < 10000 ? backendDuration * 1000 : backendDuration;
+                                    } else if (typeof backendDuration === 'string') {
+                                        // 尝试解析字符串格式的时间（如 "49.0s", "107.0s"）
+                                        const match = backendDuration.match(/(\d+\.?\d*)\s*(s|ms|秒|毫秒)/i);
+                                        if (match) {
+                                            const value = parseFloat(match[1]);
+                                            const unit = match[2].toLowerCase();
+                                            durationMs = (unit === 's' || unit === '秒') ? value * 1000 : value;
+                                        } else {
+                                            const parsed = parseFloat(backendDuration);
+                                            if (!isNaN(parsed)) {
+                                                durationMs = parsed < 10000 ? parsed * 1000 : parsed;
                                             }
                                         }
-
-                                        // 如果后端没有返回时间，使用前端计算的时间
-                                        if (durationMs === null) {
-                                            const endTime = Date.now();
-                                            durationMs = endTime - (hItem.startTime || endTime);
-                                        }
-
-                                        console.log('[Async Image] 任务完成，准备更新UI:', {
-                                            taskId,
-                                            url: primaryUrl,
-                                            sourceNodeId: savedSourceNodeId,
-                                            imageCount: imageUrls.length,
-                                            durationMs,
-                                            backendDuration,
-                                            frontendCalculated: durationMs === null ? null : (Date.now() - (hItem.startTime || Date.now()))
-                                        });
-
-                                        // 更新预览窗口（立即执行，不等待）
-                                        // 即使savedSourceNodeId为空，也尝试调用updatePreviewFromTask，它会从history中查找
-                                        const nodeIdToUse = savedSourceNodeId || hItem.sourceNodeId;
-                                        console.log('[Async Image] 准备更新预览窗口', {
-                                            taskId,
-                                            url: primaryUrl,
-                                            sourceNodeId: nodeIdToUse,
-                                            savedSourceNodeId,
-                                            hItemSourceNodeId: hItem.sourceNodeId,
-                                            imageCount: imageUrls.length
-                                        });
-                                        // 使用requestAnimationFrame确保在下一个渲染周期更新，但比setTimeout更快
-                                        requestAnimationFrame(() => {
-                                            updatePreviewFromTask(taskId, primaryUrl, 'image', nodeIdToUse, imageUrls.length > 1 ? imageUrls : null);
-                                        });
-
-                                        return {
-                                            ...hItem,
-                                            status: 'completed',
-                                            progress: 100,
-                                            url: primaryUrl,
-                                            width: w,
-                                            height: h,
-                                            durationMs,
-                                            errorMsg: null,
-                                            sourceNodeId: savedSourceNodeId || hItem.sourceNodeId, // 确保sourceNodeId被保留
-                                            output_images: imageUrls,
-                                            ...(imageUrls.length > 1 ? { mjImages: imageUrls, selectedMjImageIndex: 0 } : {})
-                                        };
-                                    } else {
-                                        console.error('[Async Image] 图片数组为空或无法提取URL:', images);
-                                    }
-                                } else {
-                                    console.error('[Async Image] 任务完成但未找到图片数据，尝试最后备用方案:', {
-                                        status,
-                                        hasData: !!data?.data,
-                                        hasDataData: !!data?.data?.data,
-                                        fullData: JSON.stringify(data, null, 2).substring(0, 1000)
-                                    });
-
-                                    // 最后备用方案：深度搜索整个响应对象，查找任何包含url的字段
-                                    const deepSearchForUrl = (obj, depth = 0) => {
-                                        if (depth > 5) return null; // 防止无限递归
-                                        if (!obj || typeof obj !== 'object') return null;
-
-                                        // 检查当前对象是否有url字段
-                                        if (obj.url && typeof obj.url === 'string' && obj.url.startsWith('http')) {
-                                            return obj.url;
-                                        }
-                                        if (obj.image_url && typeof obj.image_url === 'string' && obj.image_url.startsWith('http')) {
-                                            return obj.image_url;
-                                        }
-                                        if (obj.imageUrl && typeof obj.imageUrl === 'string' && obj.imageUrl.startsWith('http')) {
-                                            return obj.imageUrl;
-                                        }
-
-                                        // 递归搜索所有属性
-                                        for (const key in obj) {
-                                            if (obj.hasOwnProperty(key)) {
-                                                const result = deepSearchForUrl(obj[key], depth + 1);
-                                                if (result) return result;
-                                            }
-                                        }
-
-                                        return null;
-                                    };
-
-                                    const foundUrl = deepSearchForUrl(data);
-                                    if (foundUrl) {
-
-                                        // 优先使用后端返回的实际花费时间（如果存在）
-                                        let durationMs = null;
-                                        const backendDuration = data?.data?.duration || data?.data?.cost_time || data?.data?.elapsed_time ||
-                                            data?.data?.time_cost || data?.data?.spent_time || data?.duration ||
-                                            data?.cost_time || data?.elapsed_time || data?.time_cost || data?.spent_time;
-
-                                        if (backendDuration !== null && backendDuration !== undefined) {
-                                            if (typeof backendDuration === 'number') {
-                                                durationMs = backendDuration < 10000 ? backendDuration * 1000 : backendDuration;
-                                            } else if (typeof backendDuration === 'string') {
-                                                const match = backendDuration.match(/(\d+\.?\d*)\s*(s|ms|秒|毫秒)/i);
-                                                if (match) {
-                                                    const value = parseFloat(match[1]);
-                                                    const unit = match[2].toLowerCase();
-                                                    durationMs = (unit === 's' || unit === '秒') ? value * 1000 : value;
-                                                } else {
-                                                    const parsed = parseFloat(backendDuration);
-                                                    if (!isNaN(parsed)) {
-                                                        durationMs = parsed < 10000 ? parsed * 1000 : parsed;
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        // 如果后端没有返回时间，使用前端计算的时间
-                                        if (durationMs === null) {
-                                            const endTime = Date.now();
-                                            durationMs = endTime - (hItem.startTime || endTime);
-                                        }
-
-                                        // 更新预览窗口（立即执行，不等待）
-                                        // 即使savedSourceNodeId为空，也尝试调用updatePreviewFromTask，它会从history中查找
-                                        const nodeIdToUse = savedSourceNodeId || hItem.sourceNodeId;
-                                        console.log('[Async Image] 准备更新预览窗口（深度搜索）', {
-                                            taskId,
-                                            url: foundUrl,
-                                            sourceNodeId: nodeIdToUse,
-                                            savedSourceNodeId,
-                                            hItemSourceNodeId: hItem.sourceNodeId
-                                        });
-                                        // 使用requestAnimationFrame确保在下一个渲染周期更新，但比setTimeout更快
-                                        requestAnimationFrame(() => {
-                                            updatePreviewFromTask(taskId, foundUrl, 'image', nodeIdToUse, null);
-                                        });
-
-                                        return {
-                                            ...hItem,
-                                            status: 'completed',
-                                            progress: 100,
-                                            url: foundUrl,
-                                            width: w,
-                                            height: h,
-                                            durationMs,
-                                            errorMsg: null,
-                                            sourceNodeId: savedSourceNodeId || hItem.sourceNodeId, // 确保sourceNodeId被保留
-                                            output_images: [foundUrl]
-                                        };
                                     }
                                 }
 
-                                // 如果所有方法都失败，标记为失败
-                                return {
-                                    ...hItem,
-                                    status: 'failed',
-                                    errorMsg: errorMsg || '任务完成但未返回图片，请检查控制台日志查看详细响应数据'
-                                };
-                            } else if (status === 'FAILED' || status === 'ERROR' || status === 'CANCELLED' || status === 'FAILURE') {
-                                // 任务失败
-                                // V3.7.33: Handle failure duration for storyboard
-                                if (storyboardTaskMapRef.current.has(taskId)) {
-                                    const storyboardTask = storyboardTaskMapRef.current.get(taskId);
+                                // 如果后端没有返回时间，使用前端计算的时间
+                                if (durationMs === null) {
                                     const endTime = Date.now();
-                                    const durationMs = endTime - (hItem.startTime || endTime);
+                                    durationMs = endTime - (hItem.startTime || endTime);
+                                }
 
-                                    updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
-                                        status: 'failed',
-                                        errorMsg: errorMsg || `任务失败: ${status}`,
+                                console.log('[Async Image] 任务完成，准备更新UI:', {
+                                    taskId,
+                                    url: primaryUrl,
+                                    sourceNodeId: savedSourceNodeId,
+                                    imageCount: resolvedImageUrls.length,
+                                    durationMs,
+                                    backendDuration,
+                                    frontendCalculated: durationMs === null ? null : (Date.now() - (hItem.startTime || Date.now()))
+                                });
+
+                                // V3.6.1: 检查是否是分镜表的图片任务
+                                const hasStoryboardTask = storyboardTaskMapRef.current.has(taskId);
+                                if (hasStoryboardTask) {
+                                    const storyboardTask = storyboardTaskMapRef.current.get(taskId);
+                                    if (storyboardTask && storyboardTask.isImageMode) {
+                                        // V3.7.29: 传递所有图片，与同步生成保持一致
+                                        updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
+                                            output_images: resolvedImageUrls, // V3.7.29: 所有图片
+                                            output_url: primaryUrl,   // 兼容旧逻辑
+                                            selectedImageIndex: 0,    // 默认选中第一张
+                                            outputEnabled: false,     // 用户手动选择满意的
+                                            status: 'done',
+                                            durationCost: durationMs / 1000
+                                        });
+                                        // 清理任务映射
+                                        storyboardTaskMapRef.current.delete(taskId);
+                                    } else {
+                                        console.warn('[V3.7.30 Async Debug] 分镜表任务未找到或不是图片模式，无法回填');
+                                    }
+                                }
+
+                                const fallbackStoryboard = !hasStoryboardTask
+                                    ? parseStoryboardSourceNodeId(savedSourceNodeId || hItem.sourceNodeId)
+                                    : null;
+                                if (fallbackStoryboard?.isImageMode) {
+                                    updateShot(fallbackStoryboard.nodeId, fallbackStoryboard.shotId, {
+                                        output_images: resolvedImageUrls,
+                                        output_url: primaryUrl,
+                                        selectedImageIndex: 0,
+                                        outputEnabled: false,
+                                        status: 'done',
                                         durationCost: durationMs / 1000
                                     });
-                                    storyboardTaskMapRef.current.delete(taskId);
                                 }
 
-                                return {
-                                    ...hItem,
-                                    status: 'failed',
-                                    errorMsg: errorMsg || `任务失败: ${status}`
-                                };
-                            } else if (status === 'PENDING' || status === 'PROCESSING' || status === 'GENERATING' || status === 'IN_PROGRESS' || status === 'RUNNING') {
-                                // 任务进行中，根据轮询次数和进度信息计算进度
-                                let progress = 10 + (attempt * 2); // 基础进度
-
-                                // 如果有进度百分比，使用实际进度
-                                if (data?.data?.progress) {
-                                    const progressStr = String(data.data.progress);
-                                    if (progressStr.includes('%')) {
-                                        progress = parseInt(progressStr.replace('%', ''), 10) || progress;
-                                    } else if (typeof data.data.progress === 'number') {
-                                        progress = data.data.progress;
-                                    }
-                                } else if (data?.progress) {
-                                    const progressStr = String(data.progress);
-                                    if (progressStr.includes('%')) {
-                                        progress = parseInt(progressStr.replace('%', ''), 10) || progress;
-                                    } else if (typeof data.progress === 'number') {
-                                        progress = data.progress;
-                                    }
-                                }
-
-                                progress = Math.min(95, Math.max(10, progress)); // 限制在10-95%之间
+                                // 更新预览窗口（立即执行，不等待）
+                                // 即使savedSourceNodeId为空，也尝试调用updatePreviewFromTask，它会从history中查找
+                                const nodeIdToUse = savedSourceNodeId || hItem.sourceNodeId;
+                                console.log('[Async Image] 准备更新预览窗口', {
+                                    taskId,
+                                    url: primaryUrl,
+                                    sourceNodeId: nodeIdToUse,
+                                    savedSourceNodeId,
+                                    hItemSourceNodeId: hItem.sourceNodeId,
+                                    imageCount: resolvedImageUrls.length
+                                });
+                                // 使用requestAnimationFrame确保在下一个渲染周期更新，但比setTimeout更快
+                                requestAnimationFrame(() => {
+                                    updatePreviewFromTask(taskId, primaryUrl, 'image', nodeIdToUse, resolvedImageUrls.length > 1 ? resolvedImageUrls : null);
+                                });
 
                                 return {
                                     ...hItem,
-                                    status: 'generating',
-                                    progress,
-                                    errorMsg: null
-                                };
-                            } else {
-                                // 未知状态，继续轮询，但进度缓慢增加
-                                const progress = Math.min(90, 10 + (attempt * 1.5));
-                                return {
-                                    ...hItem,
-                                    status: 'generating',
-                                    progress,
-                                    errorMsg: null
+                                    status: 'completed',
+                                    progress: 100,
+                                    url: primaryUrl,
+                                    width: w,
+                                    height: h,
+                                    durationMs,
+                                    errorMsg: null,
+                                    sourceNodeId: savedSourceNodeId || hItem.sourceNodeId, // 确保sourceNodeId被保留
+                                    output_images: resolvedImageUrls,
+                                    ...(resolvedImageUrls.length > 1 ? { mjImages: resolvedImageUrls, selectedMjImageIndex: 0 } : {})
                                 };
                             }
+
+                            // 如果所有方法都失败，标记为失败
+                            return {
+                                ...hItem,
+                                status: 'failed',
+                                errorMsg: errorMsg || '任务完成但未返回图片，请检查控制台日志查看详细响应数据'
+                            };
                         }
-                        return hItem;
+
+                        if (isFailedStatus) {
+                            // 任务失败
+                            // V3.7.33: Handle failure duration for storyboard
+                            if (storyboardTaskMapRef.current.has(taskId)) {
+                                const storyboardTask = storyboardTaskMapRef.current.get(taskId);
+                                const endTime = Date.now();
+                                const durationMs = endTime - (hItem.startTime || endTime);
+
+                                updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
+                                    status: 'failed',
+                                    errorMsg: errorMsg || `任务失败: ${status}`,
+                                    durationCost: durationMs / 1000
+                                });
+                                storyboardTaskMapRef.current.delete(taskId);
+                            }
+
+                            return {
+                                ...hItem,
+                                status: 'failed',
+                                errorMsg: errorMsg || `任务失败: ${status}`
+                            };
+                        }
+
+                        if (status === 'PENDING' || status === 'PROCESSING' || status === 'GENERATING' || status === 'IN_PROGRESS' || status === 'RUNNING') {
+                            // 任务进行中，根据轮询次数和进度信息计算进度
+                            let progress = 10 + (attempt * 2); // 基础进度
+
+                            // 如果有进度百分比，使用实际进度
+                            if (data?.data?.progress) {
+                                const progressStr = String(data.data.progress);
+                                if (progressStr.includes('%')) {
+                                    progress = parseInt(progressStr.replace('%', ''), 10) || progress;
+                                } else if (typeof data.data.progress === 'number') {
+                                    progress = data.data.progress;
+                                }
+                            } else if (data?.progress) {
+                                const progressStr = String(data.progress);
+                                if (progressStr.includes('%')) {
+                                    progress = parseInt(progressStr.replace('%', ''), 10) || progress;
+                                } else if (typeof data.progress === 'number') {
+                                    progress = data.progress;
+                                }
+                            }
+
+                            progress = Math.min(95, Math.max(10, progress)); // 限制在10-95%之间
+
+                            return {
+                                ...hItem,
+                                status: 'generating',
+                                progress,
+                                errorMsg: null
+                            };
+                        }
+
+                        // 未知状态，继续轮询，但进度缓慢增加
+                        const progress = Math.min(90, 10 + (attempt * 1.5));
+                        return {
+                            ...hItem,
+                            status: 'generating',
+                            progress,
+                            errorMsg: null
+                        };
                     });
 
                     // 获取更新后的进度，用于动态调整轮询间隔
@@ -12136,8 +12675,27 @@ function TapnowApp() {
         }
 
         fetch(statusReq.url, { method: statusReq.method, headers: statusReq.headers, body: statusReq.body })
-            .then((resp) => resp.text())
-            .then(async (text) => {
+            .then(async (resp) => {
+                if (resp.status === 401 || resp.status === 402 || resp.status === 403) {
+                    const reason = resp.status === 402 ? '积分耗尽 (402)' : (resp.status === 401 ? '认证失效 (401)' : '访问被拒绝 (403)');
+                    const errorMsg = `异步任务轮询失败: ${reason}`;
+                    setHistory((prev) => prev.map((hItem) => {
+                        if (hItem.id !== taskId) return hItem;
+                        const durationMs = Date.now() - (hItem.startTime || Date.now());
+                        const storyboardTask = storyboardTaskMapRef.current.get(taskId) || parseStoryboardSourceNodeId(hItem.sourceNodeId || sourceNodeId);
+                        if (storyboardTask?.isImageMode) {
+                            updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
+                                status: 'failed',
+                                errorMsg,
+                                durationCost: durationMs / 1000
+                            });
+                            storyboardTaskMapRef.current.delete(taskId);
+                        }
+                        return { ...hItem, status: 'failed', errorMsg };
+                    }));
+                    return;
+                }
+                const text = await resp.text();
                 let statusData;
                 try {
                     statusData = text ? JSON.parse(text) : {};
@@ -12161,6 +12719,25 @@ function TapnowApp() {
                             throw new Error('异步任务结果请求构建失败');
                         }
                         const outputsResp = await fetch(outputsReq.url, { method: outputsReq.method, headers: outputsReq.headers, body: outputsReq.body });
+                        if (outputsResp.status === 401 || outputsResp.status === 402 || outputsResp.status === 403) {
+                            const reason = outputsResp.status === 402 ? '积分耗尽 (402)' : (outputsResp.status === 401 ? '认证失效 (401)' : '访问被拒绝 (403)');
+                            const errorMsg = `异步任务结果查询失败: ${reason}`;
+                            setHistory((prev) => prev.map((hItem) => {
+                                if (hItem.id !== taskId) return hItem;
+                                const durationMs = Date.now() - (hItem.startTime || Date.now());
+                                const storyboardTask = storyboardTaskMapRef.current.get(taskId) || parseStoryboardSourceNodeId(hItem.sourceNodeId || sourceNodeId);
+                                if (storyboardTask?.isImageMode) {
+                                    updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
+                                        status: 'failed',
+                                        errorMsg,
+                                        durationCost: durationMs / 1000
+                                    });
+                                    storyboardTaskMapRef.current.delete(taskId);
+                                }
+                                return { ...hItem, status: 'failed', errorMsg };
+                            }));
+                            return;
+                        }
                         const outputsText = await outputsResp.text();
                         outputsData = outputsText ? JSON.parse(outputsText) : {};
                     }
@@ -12175,8 +12752,22 @@ function TapnowApp() {
                     }
 
                     if (imageUrls.length === 0) {
+                        const deepCandidates = collectDeepImageValues(outputsData);
+                        if (deepCandidates.length > 0) {
+                            imageUrls = deepCandidates;
+                        }
+                    }
+
+                    if (imageUrls.length === 0) {
                         throw new Error('异步任务未返回结果');
                     }
+                    let resolvedImageUrls = [];
+                    try {
+                        resolvedImageUrls = await normalizeImageUrls(imageUrls);
+                    } catch (e) {
+                        resolvedImageUrls = [];
+                    }
+                    if (resolvedImageUrls.length === 0) resolvedImageUrls = imageUrls;
 
                     setHistory((prev) => {
                         const updated = prev.map((hItem) => {
@@ -12189,8 +12780,8 @@ function TapnowApp() {
                             if (hasStoryboardTask) {
                                 if (storyboardTask.isImageMode) {
                                     updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
-                                        output_images: imageUrls,
-                                        output_url: imageUrls[0],
+                                        output_images: resolvedImageUrls,
+                                        output_url: resolvedImageUrls[0],
                                         selectedImageIndex: 0,
                                         outputEnabled: false,
                                         status: 'done',
@@ -12198,24 +12789,36 @@ function TapnowApp() {
                                     });
                                     storyboardTaskMapRef.current.delete(taskId);
                                 }
+                            } else {
+                                const fallbackStoryboard = parseStoryboardSourceNodeId(hItem.sourceNodeId || sourceNodeId);
+                                if (fallbackStoryboard?.isImageMode) {
+                                    updateShot(fallbackStoryboard.nodeId, fallbackStoryboard.shotId, {
+                                        output_images: resolvedImageUrls,
+                                        output_url: resolvedImageUrls[0],
+                                        selectedImageIndex: 0,
+                                        outputEnabled: false,
+                                        status: 'done',
+                                        durationCost: durationMs / 1000
+                                    });
+                                }
                             }
 
                             const updatedItem = {
                                 ...hItem,
                                 status: 'completed',
                                 progress: 100,
-                                url: imageUrls[0],
+                                url: resolvedImageUrls[0],
                                 width: w,
                                 height: h,
                                 durationMs,
-                                output_images: imageUrls,
-                                mjImages: imageUrls.length > 1 ? imageUrls : null,
+                                output_images: resolvedImageUrls,
+                                mjImages: resolvedImageUrls.length > 1 ? resolvedImageUrls : null,
                                 selectedMjImageIndex: 0
                             };
 
                             if (updatedItem.sourceNodeId && !hasStoryboardTask) {
                                 setTimeout(() => {
-                                    updatePreviewFromTask(taskId, imageUrls[0], 'image', updatedItem.sourceNodeId, updatedItem.mjImages);
+                                    updatePreviewFromTask(taskId, resolvedImageUrls[0], 'image', updatedItem.sourceNodeId, updatedItem.mjImages);
                                 }, 0);
                             }
                             return updatedItem;
@@ -12226,11 +12829,21 @@ function TapnowApp() {
                 }
 
                 if (isFailed) {
-                    setHistory((prev) => prev.map((hItem) =>
-                        hItem.id === taskId
-                            ? { ...hItem, status: 'failed', errorMsg: errorMessage || `任务失败: ${statusValue || 'FAILED'}` }
-                            : hItem
-                    ));
+                    setHistory((prev) => prev.map((hItem) => {
+                        if (hItem.id !== taskId) return hItem;
+                        const durationMs = Date.now() - (hItem.startTime || Date.now());
+                        const errorMsg = errorMessage || `任务失败: ${statusValue || 'FAILED'}`;
+                        const storyboardTask = storyboardTaskMapRef.current.get(taskId) || parseStoryboardSourceNodeId(hItem.sourceNodeId || sourceNodeId);
+                        if (storyboardTask?.isImageMode) {
+                            updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
+                                status: 'failed',
+                                errorMsg,
+                                durationCost: durationMs / 1000
+                            });
+                            storyboardTaskMapRef.current.delete(taskId);
+                        }
+                        return { ...hItem, status: 'failed', errorMsg };
+                    }));
                     return;
                 }
 
@@ -12275,8 +12888,27 @@ function TapnowApp() {
         const finalUrl = useProxy ? buildProxyUrl(pollUrl, providerKey) : pollUrl;
 
         fetch(finalUrl, { method: 'GET', headers })
-            .then((resp) => resp.text())
-            .then((text) => {
+            .then(async (resp) => {
+                if (resp.status === 401 || resp.status === 402 || resp.status === 403) {
+                    const reason = resp.status === 402 ? '积分耗尽 (402)' : (resp.status === 401 ? '认证失效 (401)' : '访问被拒绝 (403)');
+                    const errorMsg = `ModelScope 轮询失败: ${reason}`;
+                    setHistory((prev) => prev.map((hItem) => {
+                        if (hItem.id !== taskId) return hItem;
+                        const durationMs = Date.now() - (hItem.startTime || Date.now());
+                        const storyboardTask = storyboardTaskMapRef.current.get(taskId) || parseStoryboardSourceNodeId(hItem.sourceNodeId || sourceNodeId);
+                        if (storyboardTask?.isImageMode) {
+                            updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
+                                status: 'failed',
+                                errorMsg,
+                                durationCost: durationMs / 1000
+                            });
+                            storyboardTaskMapRef.current.delete(taskId);
+                        }
+                        return { ...hItem, status: 'failed', errorMsg };
+                    }));
+                    return;
+                }
+                const text = await resp.text();
                 let data;
                 try {
                     data = JSON.parse(text);
@@ -12301,6 +12933,15 @@ function TapnowApp() {
                 const failedStatuses = new Set(['FAILED', 'ERROR', 'CANCELLED', 'FAILURE']);
                 const isCompleted = completedStatuses.has(status);
                 const isFailed = failedStatuses.has(status);
+                let resolvedImageUrls = [];
+                if (isCompleted && imageUrls.length > 0) {
+                    try {
+                        resolvedImageUrls = await normalizeImageUrls(imageUrls);
+                    } catch (e) {
+                        resolvedImageUrls = [];
+                    }
+                    if (resolvedImageUrls.length === 0) resolvedImageUrls = imageUrls;
+                }
 
                 setHistory((prev) => prev.map((hItem) => {
                     if (hItem.id !== taskId) return hItem;
@@ -12308,18 +12949,18 @@ function TapnowApp() {
                     const hasStoryboardTask = !!storyboardTask;
 
                     if (isCompleted) {
-                        if (imageUrls.length === 0) {
+                        if (resolvedImageUrls.length === 0) {
                             return { ...hItem, status: 'failed', errorMsg: 'ModelScope 返回为空' };
                         }
 
-                        const primaryUrl = imageUrls[0];
+                        const primaryUrl = resolvedImageUrls[0];
                         const endTime = Date.now();
                         const durationMs = endTime - (hItem.startTime || endTime);
 
                         if (hasStoryboardTask) {
                             if (storyboardTask.isImageMode) {
                                 updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
-                                    output_images: imageUrls,
+                                    output_images: resolvedImageUrls,
                                     output_url: primaryUrl,
                                     selectedImageIndex: 0,
                                     outputEnabled: false,
@@ -12340,13 +12981,13 @@ function TapnowApp() {
                             width: w,
                             height: h,
                             durationMs,
-                            output_images: imageUrls,
+                            output_images: resolvedImageUrls,
                             selectedMjImageIndex: 0
                         };
 
                         if (updatedItem.sourceNodeId && !hasStoryboardTask) {
                             setTimeout(() => {
-                                updatePreviewFromTask(taskId, primaryUrl, 'image', updatedItem.sourceNodeId, imageUrls);
+                                updatePreviewFromTask(taskId, primaryUrl, 'image', updatedItem.sourceNodeId, resolvedImageUrls);
                             }, 0);
                         }
 
@@ -12938,11 +13579,13 @@ function TapnowApp() {
                     ? parts[0].replace('storyboard-img-', '')
                     : parts[0].replace('storyboard-', '');
                 // 记录任务映射，包含模式信息
-                storyboardTaskMapRef.current.set(taskId, {
+                const taskInfo = {
                     nodeId: storyboardNodeId,
                     shotId: shotId,
                     isImageMode: isImageMode  // V3.6.1: 记录任务类型
-                });
+                };
+                storyboardTaskMapRef.current.set(taskId, taskInfo);
+                storyboardHistoryMapRef.current.set(taskId, taskInfo);
             }
         }
 
@@ -13801,6 +14444,8 @@ function TapnowApp() {
                     throw new Error(data.message || `即梦API错误: ${data.code} `);
                 }
 
+                const immediateImageCandidates = collectImmediateImageUrls(data);
+
                 // [保留 V2.5-4 特性] 处理异步任务 (Nano Banana 2)
                 // 如果响应中包含 task_id，进入异步轮询模式
                 if (isNanoBanana2 && (data?.task_id || (typeof data?.data === 'string' && data.data.startsWith('task-')))) {
@@ -13814,7 +14459,7 @@ function TapnowApp() {
 
                 if (asyncConfig?.enabled) {
                     const requestId = getValueByPathAny(data, asyncConfig.requestIdPaths);
-                    if (requestId) {
+                    if (requestId && immediateImageCandidates.length === 0) {
                         const asyncVars = buildAsyncTemplateVars();
                         asyncVars.requestId = requestId;
                         setHistory((prev) => prev.map((hItem) =>
@@ -13826,7 +14471,7 @@ function TapnowApp() {
                 }
                 if (!asyncConfig?.enabled && baseUrl && (String(baseUrl).includes('127.0.0.1:9527') || String(baseUrl).includes('localhost:9527'))) {
                     const requestId = getValueByPathAny(data, ['requestId', 'request_id', 'data.requestId', 'data.request_id', 'taskId', 'task_id', 'job_id']);
-                    if (requestId) {
+                    if (requestId && immediateImageCandidates.length === 0) {
                         const fallbackConfig = normalizeAsyncConfig(ASYNC_CONFIG_TEMPLATE);
                         if (fallbackConfig) {
                             const asyncVars = buildAsyncTemplateVars();
@@ -13840,8 +14485,8 @@ function TapnowApp() {
                     }
                 }
 
-                let imageUrls = [];
-                if (isChatImage) {
+                let imageUrls = immediateImageCandidates.length > 0 ? [...immediateImageCandidates] : [];
+                if (imageUrls.length === 0 && isChatImage) {
                     let chatContent = null;
                     const primaryMessage = data?.choices?.[0]?.message || data?.data?.choices?.[0]?.message;
                     if (primaryMessage?.content !== undefined) {
@@ -13874,7 +14519,7 @@ function TapnowApp() {
                         chatContent = JSON.stringify(chatContent);
                     }
                     imageUrls = extractChatImageUrls(data, chatContent || '');
-                } else if (isModelScope) {
+                } else if (imageUrls.length === 0 && isModelScope) {
                     const taskIdForPoll = data?.task_id || data?.taskId || data?.data?.task_id || data?.output?.task_id || data?.output?.taskId;
                     const rawImages = data?.output_images || data?.output?.output_images || data?.data?.output_images || data?.output?.images || data?.data?.output?.output_images || [];
                     imageUrls = Array.isArray(rawImages)
@@ -13891,7 +14536,7 @@ function TapnowApp() {
                         pollModelScopeTask(taskId, taskIdForPoll, baseUrl, apiKey, w, h, actualSourceNodeId, providerKey, useProxy, 0);
                         return;
                     }
-                } else if (isGeminiNative) {
+                } else if (imageUrls.length === 0 && isGeminiNative) {
                     const collected = new Set();
                     const pushUrl = (value, mimeHint = 'image/png') => {
                         if (!value) return;
@@ -14035,11 +14680,24 @@ function TapnowApp() {
                 }
 
                 if (imageUrls.length === 0) {
+                    const deepCandidates = collectDeepImageValues(data);
+                    if (deepCandidates.length > 0) {
+                        imageUrls = deepCandidates;
+                    }
+                }
+
+                if (imageUrls.length === 0) {
                     console.warn('[Image Parse] 未找到图片URL', {
                         keys: data && typeof data === 'object' ? Object.keys(data) : [],
                         data
                     });
                     throw new Error('未能在响应中找到图片URL');
+                }
+
+                imageUrls = await normalizeImageUrls(imageUrls);
+                if (imageUrls.length === 0) {
+                    console.warn('[Image Parse] 图片URL规范化后为空');
+                    throw new Error('图片返回结果无效');
                 }
 
                 const primaryUrl = imageUrls[0];
@@ -14050,6 +14708,7 @@ function TapnowApp() {
                 // V3.7.9: 保存所有生成的图片到 output_images 数组
                 // V3.7.30: 添加调试日志
                 const storyboardTask = storyboardTaskMapRef.current.get(taskId);
+                const fallbackStoryboard = !storyboardTask ? parseStoryboardSourceNodeId(actualSourceNodeId) : null;
                 if (storyboardTask) {
                     if (storyboardTask.isImageMode) {
                         updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
@@ -14057,13 +14716,23 @@ function TapnowApp() {
                             output_url: imageUrls[0], // 兼容旧逻辑
                             selectedImageIndex: 0, // V3.7.9: 默认选中第一张
                             outputEnabled: false, // V3.7.25: 默认不勾选，用户手动选择满意的
-                            status: 'done'
+                            status: 'done',
+                            durationCost: durationMs / 1000
                         });
                     } else {
                         console.warn('[V3.7.30 Debug] 分镜表任务未找到或不是图片模式，无法回填');
                     }
                     // 清理任务映射
                     storyboardTaskMapRef.current.delete(taskId);
+                } else if (fallbackStoryboard?.isImageMode) {
+                    updateShot(fallbackStoryboard.nodeId, fallbackStoryboard.shotId, {
+                        output_images: imageUrls,
+                        output_url: imageUrls[0],
+                        selectedImageIndex: 0,
+                        outputEnabled: false,
+                        status: 'done',
+                        durationCost: durationMs / 1000
+                    });
                 }
 
                 setHistory((prev) => {
@@ -15098,12 +15767,13 @@ function TapnowApp() {
         const assetManifest = {};
         const assetFolder = 'assets';
         const progress = typeof options.onProgress === 'function' ? options.onProgress : null;
+        const historyItems = Array.isArray(options.historyItems) ? options.historyItems : history;
         const assetCandidates = new Set();
         const trackCandidate = (url) => {
             if (!url || typeof url !== 'string') return;
             assetCandidates.add(url);
         };
-        history.forEach((item) => {
+        historyItems.forEach((item) => {
             if (!item) return;
             if (Array.isArray(item.mjImages)) item.mjImages.forEach(trackCandidate);
             if (Array.isArray(item.output_images)) item.output_images.forEach(trackCandidate);
@@ -15161,7 +15831,7 @@ function TapnowApp() {
         };
 
         // 1) 历史记录资产
-        for (const item of history) {
+        for (const item of historyItems) {
             if (!item) continue;
             const baseProxy = getItemProxyPreference(item);
             const addFromList = async (list, suffixPrefix = '') => {
@@ -15208,7 +15878,7 @@ function TapnowApp() {
         zip.file('project.json', JSON.stringify(bundleProjectData, (key, value) => (value === undefined ? null : value), 2));
         zip.file('manifest.json', JSON.stringify({ assets: assetManifest }, null, 2));
 
-        const content = await zip.generateAsync({ type: 'blob' });
+        const content = await zip.generateAsync({ type: 'blob', streamFiles: true });
         const timestamp = getCSTFilenameTimestamp();
         const bundleName = `${projectName || '未命名项目'}_${timestamp}.zip`;
         if (options.handle) {
@@ -15266,6 +15936,7 @@ function TapnowApp() {
     const handleSaveProject = async () => {
         // 方案B：统一使用资产包（Zip）保存，避免 base64 膨胀与失败
         const shouldSaveHistoryAssets = saveHistoryAssets;
+        const historySnapshot = history.slice(0, normalizeHistorySaveLimit(historySaveLimit));
         if (shouldSaveHistoryAssets) {
             const runBundleSave = async (projectData, bundleName, handle) => {
                 setDownloadProgress({ active: true, current: 0, total: 1, filename: bundleName });
@@ -15273,6 +15944,7 @@ function TapnowApp() {
                     await saveProjectAsBundle(projectData, {
                         handle,
                         filename: bundleName,
+                        historyItems: historySnapshot,
                         onProgress: ({ current, total, filename }) => {
                             setDownloadProgress({
                                 active: true,
@@ -15301,7 +15973,7 @@ function TapnowApp() {
                         nodes,
                         connections,
                         view,
-                        history,
+                        history: historySnapshot,
                         chatSessions,
                         characterLibrary,
                         modelLibrary,
@@ -15320,7 +15992,7 @@ function TapnowApp() {
                     nodes,
                     connections,
                     view,
-                    history,
+                    history: historySnapshot,
                     chatSessions,
                     characterLibrary,
                     modelLibrary,
@@ -15331,7 +16003,12 @@ function TapnowApp() {
                 return;
             } catch (e) {
                 console.error('项目打包保存失败:', e);
-                alert(`项目打包保存失败: ${e.message || e}`);
+                const msg = e?.message || String(e || '');
+                if (String(msg).toLowerCase().includes('quota')) {
+                    alert(`项目打包保存失败: ${msg}\n\n建议操作：\n1) 适当降低“历史保存上限”\n2) 或关闭“保存资产包（Zip）”后再保存`);
+                } else {
+                    alert(`项目打包保存失败: ${msg}`);
+                }
                 return;
             }
         }
@@ -15432,8 +16109,8 @@ function TapnowApp() {
                 const characterLibraryToSave = JSON.parse(JSON.stringify(characterLibrary, replacer));
                 const characterLibraryWithDataUrls = await convertBlobUrlsToDataUrls(characterLibraryToSave);
                 const historyToSave = shouldSaveHistoryAssets
-                    ? await Promise.all(history.map(item => convertHistoryItemBlobUrls(item)))
-                    : history;
+                    ? await Promise.all(historySnapshot.map(item => convertHistoryItemBlobUrls(item)))
+                    : historySnapshot;
                 const projectData = {
                     version: '2.5.7',
                     projectName,
@@ -15606,8 +16283,8 @@ function TapnowApp() {
             await writable.write(`  ], \n  "connections": ${JSON.stringify(connections, replacer, 2)}, \n  "view": ${JSON.stringify(view, replacer, 2)}, \n  "history": [\n`);
 
             // 4. 流式写入历史记录（通常是最大的部分）
-            for (let i = 0; i < history.length; i++) {
-                const item = history[i];
+            for (let i = 0; i < historySnapshot.length; i++) {
+                const item = historySnapshot[i];
                 const itemToSave = await convertHistoryItemBlobUrls(item);
 
                 const itemJson = JSON.stringify(itemToSave, replacer, 2);
@@ -15616,7 +16293,7 @@ function TapnowApp() {
                     : '    ' + itemJson.split('\n').join('\n    ');
 
                 await writable.write(indentedItemJson);
-                if (i < history.length - 1) {
+                if (i < historySnapshot.length - 1) {
                     await writable.write(',\n');
                 } else {
                     await writable.write('\n');
@@ -17093,14 +17770,14 @@ function TapnowApp() {
 
             // 检查条件更新
             if (options.onlyIfStatus) {
-                const currentShot = (node.settings?.shots || []).find(s => s.id === shotId);
+                const currentShot = (node.settings?.shots || []).find(s => isSameShotId(s.id, shotId));
                 if (currentShot && currentShot.status !== options.onlyIfStatus) {
                     console.warn(`[updateShot] 跳过更新: ${shotId}, 当前状态 ${currentShot.status} !== 期望状态 ${options.onlyIfStatus}`);
                     return prevNodes;
                 }
             }
 
-            const currentShot = (node.settings?.shots || []).find(s => s.id === shotId);
+            const currentShot = (node.settings?.shots || []).find(s => isSameShotId(s.id, shotId));
             const finalUpdates = { ...updates };
             const hasDurationCost = Object.prototype.hasOwnProperty.call(finalUpdates, 'durationCost');
             const finishingStatuses = new Set(['done', 'completed', 'failed', 'error']);
@@ -17293,6 +17970,84 @@ function TapnowApp() {
 
     // 分镜表任务映射：用于追踪从分镜表触发的生成任务
     const storyboardTaskMapRef = useRef(new Map()); // taskId -> { storyboardNodeId, shotId }
+    const storyboardHistoryMapRef = useRef(new Map()); // historyId -> { nodeId, shotId, isImageMode }
+    const storyboardHistorySyncRef = useRef(new Set()); // historyId -> synced
+
+    useEffect(() => {
+        if (!Array.isArray(history) || history.length === 0) return;
+        const synced = storyboardHistorySyncRef.current;
+        const nodesSnapshot = nodesRef.current || [];
+        const debugStoryboard = isStoryboardDebugEnabled();
+        history.forEach((item) => {
+            if (!item || synced.has(item.id)) return;
+            const status = String(item.status || '').toLowerCase();
+            if (status !== 'completed' && status !== 'done') return;
+            if (item.type && item.type !== 'image') return;
+            const mappedInfo = storyboardHistoryMapRef.current.get(item.id);
+            const storyboardInfo = mappedInfo || parseStoryboardSourceNodeId(item.sourceNodeId);
+            if (!storyboardInfo || !storyboardInfo.isImageMode) {
+                if (debugStoryboard) {
+                    console.warn('[Storyboard Sync] sourceNodeId 解析失败', { historyId: item.id, sourceNodeId: item.sourceNodeId });
+                }
+                synced.add(item.id);
+                return;
+            }
+            const node = findStoryboardNodeById(nodesSnapshot, storyboardInfo.nodeId);
+            if (!node) {
+                if (debugStoryboard) {
+                    console.warn('[Storyboard Sync] 未找到分镜节点', { historyId: item.id, nodeId: storyboardInfo.nodeId });
+                }
+                synced.add(item.id);
+                return;
+            }
+            const resolved = resolveStoryboardShotCandidate(node, storyboardInfo.shotId, item);
+            if (!resolved || !resolved.shot) {
+                if (debugStoryboard) {
+                    console.warn('[Storyboard Sync] 未找到镜头', { historyId: item.id, nodeId: storyboardInfo.nodeId, shotId: storyboardInfo.shotId });
+                }
+                synced.add(item.id);
+                return;
+            }
+            const shot = resolved.shot;
+            if (Array.isArray(shot.output_images) && shot.output_images.length > 0) {
+                synced.add(item.id);
+                return;
+            }
+            const fallbackImages = Array.isArray(item.output_images) && item.output_images.length > 0
+                ? item.output_images
+                : (Array.isArray(item.mjImages) && item.mjImages.length > 0 ? item.mjImages : (item.url ? [item.url] : []));
+            if (fallbackImages.length === 0) {
+                if (debugStoryboard) {
+                    console.warn('[Storyboard Sync] history 无可用图片', { historyId: item.id, nodeId: storyboardInfo.nodeId, shotId: storyboardInfo.shotId });
+                }
+                return;
+            }
+            if (resolved.reason === 'fallback' && !isSameShotId(shot.id, storyboardInfo.shotId)) {
+                if (debugStoryboard) {
+                    console.warn('[Storyboard Sync] 使用兜底镜头匹配', {
+                        historyId: item.id,
+                        nodeId: storyboardInfo.nodeId,
+                        originalShotId: storyboardInfo.shotId,
+                        matchedShotId: shot.id
+                    });
+                }
+            }
+            updateShot(storyboardInfo.nodeId, shot.id, {
+                output_images: fallbackImages,
+                output_url: fallbackImages[0],
+                selectedImageIndex: 0,
+                outputEnabled: false,
+                status: 'done'
+            });
+            synced.add(item.id);
+            console.log('[Storyboard Sync] 回填分镜输出', {
+                historyId: item.id,
+                nodeId: storyboardInfo.nodeId,
+                shotId: storyboardInfo.shotId,
+                count: fallbackImages.length
+            });
+        });
+    }, [history]);
 
     // 跟踪当前聚焦的提示词文本框
     const focusedPromptTextareaRef = useRef(null);
@@ -17435,6 +18190,20 @@ function TapnowApp() {
         }
     };
 
+    const scheduleStoryboardTimeout = (nodeId, shotId, startAt, mode) => {
+        const timeoutMs = mode === 'image' ? IMAGE_TASK_TIMEOUT_MS : VIDEO_TASK_TIMEOUT_MS;
+        const timeoutSeconds = Math.round(timeoutMs / 1000);
+        setTimeout(() => {
+            const currentNodes = nodesRef.current || [];
+            const node = currentNodes.find(n => n.id === nodeId);
+            const currentShot = node?.settings?.shots?.find(s => isSameShotId(s.id, shotId));
+            if (!currentShot) return;
+            if (currentShot.status !== 'generating') return;
+            if (currentShot.generationStartTime !== startAt) return;
+            updateShot(nodeId, shotId, { status: 'failed', errorMsg: `任务超时（${timeoutSeconds}s）` }, { onlyIfStatus: 'generating' });
+        }, timeoutMs);
+    };
+
     const generateSingleShot = (nodeId, shot) => {
         // 1. 构建更加丰富的 Prompt
         // 优先级：提示词 > 画面描述 > 风格标签 > 运镜
@@ -17482,7 +18251,9 @@ function TapnowApp() {
         }
 
         // 4. 更新 shot 状态为生成中
-        updateShot(nodeId, shot.id, { status: 'generating', generationStartTime: Date.now() });
+        const startAt = Date.now();
+        updateShot(nodeId, shot.id, { status: 'generating', generationStartTime: startAt });
+        scheduleStoryboardTimeout(nodeId, shot.id, startAt, 'video');
 
         // 5. 构建覆盖选项 - 确保 duration 格式正确
         let durationValue = shot.duration || getDefaultDurationForModel(selectedModel);
@@ -17516,7 +18287,10 @@ function TapnowApp() {
         // 这里我们先调用 startGeneration，任务映射会在 startGeneration 内部完成
 
         // 调用核心生成函数
-        startGeneration(finalPrompt, 'video', sourceImages, virtualNodeId, overrideOptions);
+        startGeneration(finalPrompt, 'video', sourceImages, virtualNodeId, overrideOptions).catch((err) => {
+            const msg = err?.message || '视频生成失败';
+            updateShot(nodeId, shot.id, { status: 'failed', errorMsg: msg }, { onlyIfStatus: 'generating' });
+        });
     };
 
     // V3.6.1: 智能分镜图片生成函数
@@ -17569,7 +18343,9 @@ function TapnowApp() {
         }
 
         // 4. 更新 shot 状态为生成中（已验证 API 配置有效）
-        updateShot(nodeId, shot.id, { status: 'generating', generationStartTime: Date.now() });
+        const startAt = Date.now();
+        updateShot(nodeId, shot.id, { status: 'generating', generationStartTime: startAt });
+        scheduleStoryboardTimeout(nodeId, shot.id, startAt, 'image');
 
         // 5. 构建覆盖选项
         const overrideOptions = {
@@ -17584,7 +18360,10 @@ function TapnowApp() {
         const virtualNodeId = `storyboard-img-${nodeId}-shot-${shot.id}`;
 
         // 7. 调用核心生成函数
-        startGeneration(finalPrompt, 'image', sourceImages, virtualNodeId, overrideOptions);
+        startGeneration(finalPrompt, 'image', sourceImages, virtualNodeId, overrideOptions).catch((err) => {
+            const msg = err?.message || '图片生成失败';
+            updateShot(nodeId, shot.id, { status: 'failed', errorMsg: msg }, { onlyIfStatus: 'generating' });
+        });
     };
 
     // 拓展图片 Zoom Out 功能
@@ -20373,7 +21152,7 @@ ${inputText.substring(0, 15000)} ... (截断)
         const zip = new JSZip();
         let count = 0;
         const totalItems = items.length;
-        const totalSteps = totalItems + 1; // +1 for ZIP packaging
+        const totalSteps = totalItems;
 
         // V3.5.12: Set download progress for visible progress bar
         setDownloadProgress({ active: true, current: 0, total: totalSteps });
@@ -20446,7 +21225,7 @@ ${inputText.substring(0, 15000)} ... (截断)
             saveAs(content, `tapnow-assets-${timestamp}.zip`);
 
             // V3.5.12: Reset download progress
-            setDownloadProgress({ active: false, current: 0, total: 0 });
+            setDownloadProgress({ active: false, current: totalSteps, total: totalSteps });
         } catch (e) {
             console.error('打包过程出错:', e);
             setDownloadProgress({ active: false, current: 0, total: 0 });
@@ -20574,7 +21353,8 @@ ${inputText.substring(0, 15000)} ... (截断)
         }
 
         const zip = new JSZip();
-        setDownloadProgress({ active: true, current: 0, total: items.length });
+        const totalSteps = items.length;
+        setDownloadProgress({ active: true, current: 0, total: totalSteps });
         let added = 0;
 
         for (const item of items) {
@@ -20585,7 +21365,7 @@ ${inputText.substring(0, 15000)} ... (截断)
             } catch (e) {
                 console.error('下载资源失败:', item.filename, e);
             }
-            setDownloadProgress(prev => ({ ...prev, current: prev.current + 1 }));
+            setDownloadProgress(prev => ({ ...prev, current: Math.min(totalSteps, prev.current + 1) }));
         }
 
         if (added === 0) {
@@ -20595,8 +21375,9 @@ ${inputText.substring(0, 15000)} ... (截断)
         }
 
         const content = await zip.generateAsync({ type: 'blob' });
+        setDownloadProgress(prev => ({ ...prev, current: totalSteps }));
         saveAs(content, zipName);
-        setDownloadProgress({ active: false, current: 0, total: 0 });
+        setDownloadProgress({ active: false, current: totalSteps, total: totalSteps });
     };
 
 
@@ -24162,7 +24943,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                             e.preventDefault();
                             e.stopPropagation();
 
-                            const currentShot = (node.settings?.shots || []).find(s => s.id === shotId);
+                            const currentShot = (node.settings?.shots || []).find(s => isSameShotId(s.id, shotId));
                             const currentMode = node.settings?.mode || 'video';
                             const applyDroppedImage = (imageUrl) => {
                                 if (!imageUrl) return false;
@@ -24391,6 +25172,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         if (matches.length > 0) {
                                                             const existingShots = node.settings?.shots || [];
                                                             const mergedShots = [...existingShots];
+                                                            const mode = node.settings?.mode || 'video';
+                                                            const defaultModel = mode === 'image'
+                                                                ? resolveModelKey(localStorage.getItem('tapnow_last_image_model') || apiConfigs.find(c => isImageModelType(c.type))?.id || '')
+                                                                : resolveModelKey(localStorage.getItem('tapnow_last_video_model') || apiConfigs.find(c => c.type === 'Video')?.id || '');
+                                                            const defaultRatio = mode === 'image' ? '1:1' : '16:9';
+                                                            const defaultDuration = mode === 'video' ? getDefaultDurationForModel(defaultModel) : undefined;
                                                             matches.forEach((m, i) => {
                                                                 if (i < existingShots.length) {
                                                                     mergedShots[i] = { ...mergedShots[i], prompt: m.text, description: m.text };
@@ -24399,11 +25186,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         id: Date.now() + Math.random() + i,
                                                                         prompt: m.text,
                                                                         description: m.text,
-                                                                        model: resolveModelKey(localStorage.getItem('tapnow_last_video_model') || ''),
-                                                                        duration: 5,
+                                                                        model: defaultModel,
+                                                                        ratio: defaultRatio,
+                                                                        duration: defaultDuration,
                                                                         status: 'draft',
-                                                                        outputEnabled: true,
-                                                                        selectedImageIndex: 0
+                                                                        outputEnabled: false,
+                                                                        selectedImageIndex: -1
                                                                     });
                                                                 }
                                                             });
@@ -25005,6 +25793,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             const connectedText = connectedTexts.join('\n');
                                                             const internalText = node.settings?.scriptText || '';
                                                             const text = connectedText || internalText;
+                                                            const mode = node.settings?.mode || 'video';
+                                                            const defaultModel = mode === 'image'
+                                                                ? resolveModelKey(localStorage.getItem('tapnow_last_image_model') || apiConfigs.find(c => isImageModelType(c.type))?.id || '')
+                                                                : resolveModelKey(localStorage.getItem('tapnow_last_video_model') || apiConfigs.find(c => c.type === 'Video')?.id || '');
+                                                            const defaultRatio = mode === 'image' ? '1:1' : '16:9';
+                                                            const defaultDuration = mode === 'video' ? getDefaultDurationForModel(defaultModel) : undefined;
 
                                                             const matches = [];
                                                             // Enhanced split pattern: #1, 【1】, or 1.
@@ -25057,11 +25851,12 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                         id: Date.now() + Math.random() + i,
                                                                         prompt: m.text,
                                                                         description: m.text,
-                                                                        model: resolveModelKey(localStorage.getItem('tapnow_last_video_model') || ''),
-                                                                        duration: 5,
+                                                                        model: defaultModel,
+                                                                        ratio: defaultRatio,
+                                                                        duration: defaultDuration,
                                                                         status: 'draft',
-                                                                        outputEnabled: true,
-                                                                        selectedImageIndex: 0
+                                                                        outputEnabled: false,
+                                                                        selectedImageIndex: -1
                                                                     });
                                                                 }
                                                             });
@@ -25237,8 +26032,8 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     model: resolveModelKey(localStorage.getItem('tapnow_last_video_model') || ''),
                                                                     duration: 5,
                                                                     status: 'draft',
-                                                                    outputEnabled: true,
-                                                                    selectedImageIndex: 0
+                                                                    outputEnabled: false,
+                                                                    selectedImageIndex: -1
                                                                 });
                                                                 updateNodeSettings(node.id, { shots: newShots });
                                                             }}
@@ -28037,28 +28832,21 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 className={`p-3 border-b flex justify-between items-center ${theme === 'dark' ? 'border-zinc-800' : 'border-zinc-200'
                                     }`}
                             >
-                                <div className="flex flex-col gap-1">
-                                    <h3
-                                        className={`font-bold text-xs leading-tight ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'
-                                            }`}
-                                    >
-                                        <span className="block">{t('生成')}</span>
-                                        <span className="block">{t('历史')}</span>
-                                    </h3>
-                                    {/* V3.4.12: 下载进度条 */}
-                                    {downloadProgress.active && (
-                                        <div className="flex items-center gap-1.5">
-                                            <div className="w-16 h-1.5 bg-zinc-700 rounded-full overflow-hidden">
-                                                <div
-                                                    className="h-full bg-blue-500 transition-all duration-200"
-                                                    style={{ width: `${(downloadProgress.current / downloadProgress.total) * 100}%` }}
-                                                />
-                                            </div>
-                                            <span className="text-[9px] text-zinc-500 font-mono">
-                                                {downloadProgress.current}/{downloadProgress.total}
-                                            </span>
-                                        </div>
-                                    )}
+                                <div className="flex flex-col gap-1 min-w-0">
+                                    <div className="flex items-end gap-2">
+                                        <h3
+                                            className={`font-bold text-xs leading-tight ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'
+                                                }`}
+                                        >
+                                            <span className="block">{t('生成')}</span>
+                                            <span className="block">{t('历史')}</span>
+                                        </h3>
+                                        <span className="text-[9px] text-zinc-500 font-mono whitespace-nowrap">
+                                            {downloadDisplay.visible
+                                                ? `${downloadDisplay.current}/${downloadDisplay.total > 0 ? Math.round((downloadDisplay.current / downloadDisplay.total) * 100) : 0}%`
+                                                : `${history.length}/${historyLimit > 0 ? Math.min(100, Math.round((history.length / historyLimit) * 100)) : 0}%`}
+                                        </span>
+                                    </div>
                                 </div>
                                 <div className="flex items-center gap-1">
                                     <button
@@ -28231,6 +29019,16 @@ ${inputText.substring(0, 15000)} ... (截断)
                                     </button>
                                 </div>
                             </div>
+                            {downloadDisplay.visible && (
+                                <div className="w-full px-3 pb-2">
+                                    <div className={`w-full h-1.5 rounded-full overflow-hidden ${theme === 'dark' ? 'bg-zinc-800' : 'bg-zinc-200'}`}>
+                                        <div
+                                            className="h-full bg-blue-500 transition-all duration-200"
+                                            style={{ width: `${downloadDisplay.total > 0 ? (downloadDisplay.current / downloadDisplay.total) * 100 : 0}%` }}
+                                        />
+                                    </div>
+                                </div>
+                            )}
                             {localCacheEnabled && localCacheBannerVisible && (
                                 <div className={`w-full border-b ${theme === 'dark' ? 'border-zinc-800' : theme === 'solarized' ? 'border-[#d7cfb2]' : 'border-zinc-200'}`}>
                                     <div className={`flex items-center justify-between gap-2 text-[10px] px-3 py-1.5 ${localCacheServerConnected
@@ -28262,6 +29060,15 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 </div>
                             )}
                             <div className="flex-1 overflow-y-auto custom-scrollbar p-3 space-y-3">
+                                {(historyQueuePanelOpen || historyCachePanelOpen) && (
+                                    <div
+                                        className={`sticky top-0 z-20 space-y-3 pb-3 ${theme === 'dark'
+                                            ? 'bg-[#121214]'
+                                            : theme === 'solarized'
+                                                ? 'bg-[#fdf6e3]'
+                                                : 'bg-zinc-50'
+                                            }`}
+                                    >
                                 {historyQueuePanelOpen && (
                                     <div className={`rounded-lg border p-3 space-y-3 ${theme === 'dark' ? 'bg-zinc-900/60 border-zinc-800' : 'bg-white border-zinc-200'}`}>
                                         <div className="flex items-center justify-between gap-2">
@@ -28347,7 +29154,7 @@ ${inputText.substring(0, 15000)} ... (截断)
 
                                             const getShotLabel = (nodeId, shotId) => {
                                                 const node = nodesMap.get(nodeId);
-                                                const shot = node?.settings?.shots?.find(s => s.id === shotId);
+                                                const shot = node?.settings?.shots?.find(s => isSameShotId(s.id, shotId));
                                                 return (shot?.description || shot?.prompt || '未命名镜头').trim();
                                             };
 
@@ -28597,6 +29404,8 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             </button>
                                         </div>
                                     </div>
+                                )}
+                                </div>
                                 )}
                                 {/* V3.4.16: 历史列表添加本次生成分隔线 */}
                                 {(() => {
@@ -29216,13 +30025,26 @@ ${inputText.substring(0, 15000)} ... (截断)
                             onDrop={handleCanvasDrop} onDragOver={handleCanvasDragOver}
                             style={{
                                 backgroundColor: theme === 'dark' ? '#09090b' : (theme === 'solarized' ? '#fdf6e3' : '#f4f4f5'),
-                                backgroundImage: theme === 'dark'
-                                    ? 'radial-gradient(#27272a 1px, transparent 1px)'
-                                    : theme === 'solarized'
-                                        ? 'radial-gradient(#eee8d5 1px, transparent 1px)'
-                                        : 'radial-gradient(rgba(0, 0, 0, 0.08) 0.5px, transparent 0.5px)',
-                                backgroundSize: `${20 * view.zoom}px ${20 * view.zoom}px`,
-                                backgroundPosition: `${view.x}px ${view.y}px`,
+                                backgroundImage: (() => {
+                                    const mergeThreshold = 0.6;
+                                    const mergeScale = view.zoom < mergeThreshold ? 2 : 1;
+                                    const gridSize = Math.max(12, 20 * view.zoom * mergeScale);
+                                    const dotRadius = Math.max(0.55, Math.min(1.4, gridSize * 0.035));
+                                    const haloRadius = dotRadius + 0.65;
+                                    const dotColor = theme === 'dark'
+                                        ? 'rgba(212, 212, 216, 0.38)'
+                                        : theme === 'solarized'
+                                            ? 'rgba(36, 36, 39, 0.34)'
+                                            : 'rgba(36, 36, 39, 0.32)';
+                                    const haloColor = theme === 'dark'
+                                        ? 'rgba(212, 212, 216, 0.22)'
+                                        : theme === 'solarized'
+                                            ? 'rgba(36, 36, 39, 0.2)'
+                                            : 'rgba(36, 36, 39, 0.2)';
+                                    return `radial-gradient(${dotColor} ${dotRadius}px, transparent ${dotRadius + 0.2}px), radial-gradient(${haloColor} ${haloRadius}px, transparent ${haloRadius + 0.2}px)`;
+                                })(),
+                                backgroundSize: `${Math.max(12, 20 * view.zoom * (view.zoom < 0.6 ? 2 : 1))}px ${Math.max(12, 20 * view.zoom * (view.zoom < 0.6 ? 2 : 1))}px`,
+                                backgroundPosition: `${Math.round(view.x)}px ${Math.round(view.y)}px`,
                                 backgroundRepeat: 'repeat',
                                 WebkitFontSmoothing: 'antialiased',
                                 MozOsxFontSmoothing: 'grayscale',
@@ -30283,29 +31105,46 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 const currentItem = lightboxItemRef.current;
                                 if (!currentItem || currentItem.storyboardContext) return; // 分镜模式不使用历史导航
 
-                                const items = historyDisplayItems;
+                                const snapshotIds = lightboxHistorySnapshotRef.current;
+                                let items = snapshotIds && snapshotIds.length > 0
+                                    ? snapshotIds.map(id => historyMap.get(id)).filter(Boolean)
+                                    : historyNavItems;
                                 if (!items.length) return;
-                                const currentIndex = items.findIndex(h => h.id === currentItem.id);
-                                if (currentIndex === -1) return;
 
-                                const targetIndex = findHistoryNavIndex(items, currentIndex, direction);
-                                if (targetIndex < 0) return;
-                                const candidate = items[targetIndex];
-                                if (!candidate) return;
-                                // V3.8: 切换组时始终重置 selectedMjImageIndex 为 0
-                                const imgIndex = 0;
-                                const selectedUrl = candidate.mjImages && candidate.mjImages.length > 1
-                                    ? candidate.mjImages[imgIndex]
-                                    : candidate.url;
-                                const resolvedUrl = selectedUrl
-                                    ? resolveHistoryUrl(candidate, selectedUrl)
-                                    : resolveHistoryUrl(candidate);
+                                let currentIndex = items.findIndex(h => h.id === currentItem.id);
+                                if (currentIndex === -1) {
+                                    items = historyNavItems;
+                                    currentIndex = items.findIndex(h => h.id === currentItem.id);
+                                    if (currentIndex === -1) return;
+                                    lightboxHistorySnapshotRef.current = items.map(h => h.id);
+                                }
+
+                                const step = direction < 0 ? -1 : 1;
+                                let nextIndex = currentIndex;
+                                let candidate = null;
+                                let resolvedUrl = '';
+                                let selectedIndex = 0;
+                                for (let i = 0; i < items.length; i++) {
+                                    nextIndex += step;
+                                    if (nextIndex < 0 || nextIndex >= items.length) return;
+                                    const nextItem = items[nextIndex];
+                                    if (!nextItem) continue;
+                                    const preview = getHistoryNavPreview(nextItem);
+                                    if (!preview.url) continue;
+                                    candidate = nextItem;
+                                    resolvedUrl = preview.url;
+                                    selectedIndex = preview.index;
+                                    break;
+                                }
+                                if (!candidate || candidate.id === currentItem.id) return;
+
+                                lightboxHistoryIndexRef.current = nextIndex;
                                 setHistoryFocusId(candidate.id);
-                                setHistoryFocusIndex(targetIndex);
+                                setHistoryFocusIndex(nextIndex);
                                 setLightboxItem({
                                     ...candidate,
                                     url: resolvedUrl,
-                                    selectedMjImageIndex: imgIndex,
+                                    selectedMjImageIndex: selectedIndex,
                                     storyboardContext: null
                                 });
                             }}
@@ -30395,6 +31234,44 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             </button>
                                                         </div>
                                                         <p className="text-[9px] text-zinc-500">{t('导出时打包历史图片/视频与项目文件，便于离线恢复。')}</p>
+                                                        <div className="mt-2 flex items-center justify-between gap-2">
+                                                            <span className={`text-xs ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>{t('历史保存上限')}</span>
+                                                            <div className="flex items-center gap-2">
+                                                                <input
+                                                                    type="number"
+                                                                    min={HISTORY_SAVE_LIMIT_MIN}
+                                                                    max={HISTORY_SAVE_LIMIT_MAX}
+                                                                    step="10"
+                                                                    value={historySaveLimitInput}
+                                                                    onChange={(e) => {
+                                                                        const raw = e.target.value;
+                                                                        setHistorySaveLimitInput(raw);
+                                                                        if (historySaveLimitTimerRef.current) {
+                                                                            clearTimeout(historySaveLimitTimerRef.current);
+                                                                        }
+                                                                        historySaveLimitTimerRef.current = setTimeout(() => {
+                                                                            applyHistorySaveLimitInput(raw);
+                                                                        }, 1000);
+                                                                    }}
+                                                                    onBlur={() => {
+                                                                        if (historySaveLimitTimerRef.current) {
+                                                                            clearTimeout(historySaveLimitTimerRef.current);
+                                                                            historySaveLimitTimerRef.current = null;
+                                                                        }
+                                                                        applyHistorySaveLimitInput(historySaveLimitInput);
+                                                                        if (!historySaveLimitInput || Number.isNaN(Number.parseInt(historySaveLimitInput, 10))) {
+                                                                            setHistorySaveLimitInput(String(historySaveLimit));
+                                                                        }
+                                                                    }}
+                                                                    className={`w-20 text-xs rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                        ? 'bg-zinc-800 border-zinc-700 text-zinc-300'
+                                                                        : 'bg-white border-zinc-300 text-zinc-800'
+                                                                        }`}
+                                                                />
+                                                                <span className="text-[10px] text-zinc-500">条</span>
+                                                            </div>
+                                                        </div>
+                                                        <p className="text-[9px] text-zinc-500">{t('影响历史持久化与打包范围，最大160条。')}</p>
                                                     </div>
                                                     <div>
                                                         <div className="flex flex-col gap-1">
@@ -31022,6 +31899,8 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                                 type="text"
                                                                                 value={api.id || ''}
                                                                                 onChange={(e) => updateApiConfig(api._uid, { id: e.target.value })}
+                                                                                onKeyDown={(e) => e.stopPropagation()}
+                                                                                onClick={(e) => e.stopPropagation()}
                                                                                 className={`text-xs bg-transparent border-b border-transparent hover:border-zinc-600 focus:border-blue-500 outline-none flex-1 min-w-[120px] font-mono ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}
                                                                                 placeholder="model-id"
                                                                                 title={`模型 ID: ${api.id}`}
